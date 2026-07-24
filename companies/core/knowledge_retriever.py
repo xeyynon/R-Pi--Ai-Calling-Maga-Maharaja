@@ -56,8 +56,18 @@ def _split_sections(text: str) -> list[str]:
 
 
 def _score_section(section: str, query_words: set[str]) -> int:
+    """
+    Word-boundary matching, not plain substring — otherwise a query
+    word like "confirm" also matches unrelated occurrences of
+    "confirmation" (boilerplate like "prepared after order
+    confirmation" in product tables), diluting the score of the
+    section the query is actually about.
+    """
     section_lower = section.lower()
-    return sum(1 for word in query_words if word in section_lower)
+    return sum(
+        1 for word in query_words
+        if re.search(rf"\b{re.escape(word)}\b", section_lower)
+    )
 
 
 def get_core_context(company_dir: Path) -> str:

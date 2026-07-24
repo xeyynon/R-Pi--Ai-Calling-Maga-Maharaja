@@ -5,10 +5,17 @@
 All pickles: Homemade, no preservatives, fresh 45+ days. Packed in
 sealed packets (not bottles) — fully sealed, no leaks guaranteed.
 
+Avakaya IS the raw mango pickle — also called "mango pickle", "aam ka
+achar" (Hindi), or "mamidikaya pickle". Kotha Avakaya is the same raw
+mango pickle made with fresh new-season mangoes. If a customer asks
+for "mango pickle" or "aam ka achar" in any language, that means
+Avakaya — quote its price, don't treat it as a different or unknown
+product.
+
 | Product | 250g | 500g | 1kg |
 |---|---|---|---|
-| Avakaya | ₹150 | ₹290 | ₹580 |
-| Kotha Avakaya | ₹210 | ₹400 | ₹750 |
+| Avakaya (raw mango pickle / aam ka achar) | ₹150 | ₹290 | ₹580 |
+| Kotha Avakaya (new-season mango pickle) | ₹210 | ₹400 | ₹750 |
 | Gongura Pickle | ₹150 | ₹290 | ₹580 |
 | Tomato Pickle | ₹150 | ₹290 | ₹580 |
 | Ginger Pickle | ₹150 | ₹290 | ₹580 |

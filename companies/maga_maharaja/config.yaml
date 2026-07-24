@@ -1,8 +1,14 @@
 company_name: "Maga Maharaja"
 
-# Used by the validator whenever intent is off_topic, or the LLM's
-# reply trips an off-topic signal.
-fallback_message: "Nenu Maga Maharaja  products and services gurinchi help cheyagalanu andi 😊"
+# Used by the validator whenever the reply is empty or trips an
+# off-topic signal. Keyed by detected language so the caller always
+# hears the fallback in the language they were speaking, not always
+# in Telugu. conversation_manager.py falls back to "en-in" if the
+# detected language isn't one of these keys.
+fallback_messages:
+  en-in: "I can help you with Maga Maharaja products and services 😊"
+  te-in: "Nenu Maga Maharaja  products and services gurinchi help cheyagalanu andi 😊"
+  hi-in: "Main Maga Maharaja ke products aur services ke baare mein madad kar sakta hoon 😊"
 
 # Base system prompt. The always-on core (identity, language rules,
 # bot behavior rules, escalation triggers) and the matched intent file

@@ -79,6 +79,15 @@ def ask(model: str, messages: list[dict], max_tokens: int, temperature: float) -
                 system_instruction=system_instruction,
                 max_output_tokens=max_tokens,
                 temperature=temperature,
+                # Gemini 2.5 models "think" before answering by default,
+                # spending output tokens on hidden reasoning. For short
+                # knowledge-grounded phone replies that reasoning isn't
+                # needed, and without disabling it, max_tokens can be
+                # entirely consumed by thinking — leaving an empty reply
+                # (finish_reason=MAX_TOKENS with zero visible text).
+                # Disabling it also cuts latency since thinking happens
+                # before the visible answer is generated.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         return (response.text or "").strip()

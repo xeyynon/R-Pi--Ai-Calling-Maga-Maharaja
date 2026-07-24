@@ -44,9 +44,15 @@ class ConversationManager:
             self.config = yaml.safe_load(f)
 
         self.base_prompt = self.config["system_prompt"]
-        self.fallback_message = self.config["fallback_message"]
+        self.fallback_messages = {
+            lang.lower(): msg for lang, msg in self.config["fallback_messages"].items()
+        }
 
         self.core_context = get_core_context(company_dir)
+
+    def _fallback_for(self, detected_language: str) -> str:
+        key = (detected_language or "en-in").lower()
+        return self.fallback_messages.get(key, self.fallback_messages["en-in"])
 
     def _build_system_prompt(self, context: str, knowledge: str, detected_language: str) -> str:
         parts = [self.base_prompt]
@@ -87,6 +93,6 @@ class ConversationManager:
             temperature=self.temperature,
         )
 
-        reply = validate_reply(reply, self.fallback_message)
+        reply = validate_reply(reply, self._fallback_for(detected_language))
 
         return reply, detected_language or "en-IN"

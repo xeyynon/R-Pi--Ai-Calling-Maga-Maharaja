@@ -82,7 +82,10 @@ USER_LOCATION = "Hyderabad, Telangana, India"
 # Greeting — spoken in English at the start of every call (per the
 # always-on language rules: always start in English, switch only
 # after the caller uses another language).
-GREETING = "Hello! Welcome to Maga Maharaja Foods. How can I help you today?"
+GREETING = (
+    "Hello! Welcome to Maga Maharaja Foods. I might take a few seconds "
+    "to answer, so please bear with me. How can I help you today?"
+)
 
 # VAD / Audio
 SAMPLE_RATE       = 16000
@@ -95,9 +98,71 @@ SPEECH_MIN_FRAMES = 20     # sustained speech frames required
 SILENCE_FRAMES    = 25     # consecutive silent frames = utterance ended
 MIN_UTTERANCE_SEC = 0.8
 MAX_UTTERANCE_SEC = 12.0
-MIN_WORDS         = 2      # lowered from 3 — Telugu/Hindi short replies
-                            # ("avunu andi", "sare andi") are valid at 2 words
+MIN_WORDS         = 1      # lowered from 2 — single-word acknowledgments
+                            # ("ok", "hmm", "avunu") are real, valid utterances,
+                            # just ones that get handled without an LLM call
+                            # (see ACK_WORDS / REPEAT_KEYWORDS below)
 MIN_WORDS_PER_SEC = 0.4    # below this = noise hallucination
+
+# Acknowledgment words (English/Telugu/Hindi) — a caller saying just
+# one of these is confirming they heard the last reply, not asking a
+# new question. Recognizing them here means we don't burn a Gemini
+# call (and don't speak again) for a bare "ok"/"hmm"/"achha".
+ACK_WORDS = {
+    "ok", "okay", "k", "hmm", "hm", "mm", "mhm", "uh", "uhu", "yeah", "yep",
+    "yes", "alright", "sure", "fine", "cool", "great", "thanks", "thank",
+    "andi", "sare", "sari", "avunu", "ha", "le",                       # Telugu
+    "haan", "acha", "achha", "ji", "theek", "thik", "hai",             # Hindi
+}
+
+# Substrings that indicate the caller is asking to hear the last reply
+# again, in any of the three languages — handled by replaying the
+# cached last TTS reply instead of a fresh Gemini + TTS round trip.
+REPEAT_KEYWORDS = (
+    "repeat", "again", "pardon", "one more time", "once more", "say that",
+    "come again", "what did you say",
+    "malli cheppu", "malli cheppandi", "inka cheppandi",       # Telugu
+    "phir se", "dobara", "dubara",                             # Hindi
+)
+
+# Google STT's language auto-detection is unreliable for romanized
+# Hindi/Telugu — genuine Hindi speech has been observed tagged as
+# "en-in". Since that tag gets passed to the LLM as a stated fact
+# ("the caller's detected language is..."), a wrong tag directly
+# causes a wrong reply language (replying in Telugu to a Hindi caller
+# or vice versa). These are common function words that are strong,
+# near-exclusive markers of one language over the other in romanized
+# script — used to override Google's tag when it disagrees.
+HINDI_MARKERS = {
+    "hai", "hain", "mujhe", "chahiye", "karna", "karo", "kya", "aap",
+    "hoon", "tha", "thi", "nahi", "haan", "kaise", "kitna", "kitne",
+    "mera", "meri", "tumhe", "aapko", "dijiye", "batao", "bataiye",
+    "kar", "raha", "rahi", "chahiyen", "acha", "achha", "theek", "hain",
+}
+TELUGU_MARKERS = {
+    "andi", "meeku", "meeru", "kavala", "kavali", "entha", "enti",
+    "undi", "ledu", "chestha", "chestunna", "cheppandi", "kosam",
+    "nenu", "nuvvu", "vachindi", "ivvandi", "cheyagalanu", "gurinchi",
+    "chepthanu", "pampistamu", "avunu", "sare", "sari",
+}
+
+
+def _detect_indic_language(transcript: str) -> str | None:
+    """
+    Returns "hi-in" or "te-in" if the transcript's vocabulary clearly
+    leans one way, else None (ambiguous — let the caller keep
+    whatever language_code Google STT reported).
+    """
+    words = set(re.findall(r"\w+", transcript.lower()))
+    hindi_score = len(words & HINDI_MARKERS)
+    telugu_score = len(words & TELUGU_MARKERS)
+
+    if hindi_score > telugu_score:
+        return "hi-in"
+    if telugu_score > hindi_score:
+        return "te-in"
+    return None
+
 
 # Hallucination filter
 # NOTE: the old ASCII_RATIO_MIN=0.85 check has been REMOVED — it would
@@ -113,6 +178,8 @@ HALLUCINATION_PHRASES = (
 )
 
 # Timing
+GREETING_DELAY_SEC = 1.0  # wait after call connects before speaking the
+                           # greeting, so the SCO link has time to stabilize
 WATCHDOG_SEC   = 3     # Bluetooth poll interval
 RECONNECT_SEC  = 2     # wait before reopening stream after call drop
 ECHO_TAIL_SEC  = 1.2   # silence after TTS before mic resumes — Bluetooth SCO
@@ -147,6 +214,8 @@ _history    = []
 _conv_mgr   = None   # ConversationManager instance, set in main()
 _vad        = webrtcvad.Vad(VAD_MODE)
 
+_last_reply_wav = None   # cached audio of the last spoken reply, for "repeat please"
+
 audio_q     = queue.Queue(maxsize=3)
 reply_q     = queue.Queue(maxsize=3)
 
@@ -166,6 +235,51 @@ def _find_nodes():
         return None, None
 
 
+def _kill_loopback_links():
+    """
+    WirePlumber treats the Bluetooth HFP link as a normal "phone call
+    through your laptop" device and auto-routes it through the Pi's
+    onboard ALSA output ("mailbox") for local monitoring — which
+    creates a loop: bluez_input (caller's incoming voice) -> onboard
+    speaker -> onboard speaker's monitor port -> bluez_output (back
+    out to the caller), so the caller hears their own voice echoed
+    back. Our script never wants that pass-through (we only want our
+    own pw-record/pw-play talking to the bluez nodes directly), so
+    every poll we find and cut any alsa_output<->bluez_ link.
+    """
+    try:
+        out = subprocess.run(
+            ["pw-link", "-l"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return
+
+    current = None
+    for line in out.splitlines():
+        m = re.match(r"\s*\|(->|<-)\s*(.+)$", line)
+        if m is None:
+            current = line.strip()
+            continue
+        if current is None:
+            continue
+        arrow, other = m.group(1), m.group(2).strip()
+
+        # "|->" means current is the output/source, other is the input/dest.
+        # "|<-" means the reverse: other is the source, current is the dest.
+        src, dst = (current, other) if arrow == "->" else (other, current)
+
+        if ("alsa_output" in src and "bluez_" in dst) or \
+           ("alsa_output" in dst and "bluez_" in src):
+            try:
+                subprocess.run(
+                    ["pw-link", "-d", src, dst],
+                    capture_output=True, timeout=5
+                )
+                log.info(f"[AUDIO] Cut loopback link: {src} -> {dst}")
+            except Exception as e:
+                log.debug(f"[AUDIO] Failed to cut link {src} -> {dst}: {e}")
+
+
 def _device_name():
     try:
         out = subprocess.run(
@@ -179,8 +293,10 @@ def _device_name():
 
 
 def _clear_history(reason=""):
+    global _last_reply_wav
     with _hist_lock:
         _history.clear()
+        _last_reply_wav = None
     log.info(f"History cleared{': ' + reason if reason else '.'}")
 
 
@@ -196,6 +312,9 @@ def watchdog_thread():
             _out_node = out
 
         call_now = bool(inp and out)
+
+        if call_now:
+            _kill_loopback_links()
 
         if call_now and not had_call:
             log.info(f"Call detected — device: {_device_name()}")
@@ -285,6 +404,18 @@ def _is_self_echo(transcript: str) -> bool:
     return False
 
 
+def _is_acknowledgment(transcript: str) -> bool:
+    """True if every word is filler/acknowledgment ("ok", "hmm", "achha andi")."""
+    words = re.findall(r"\w+", transcript.lower())
+    return bool(words) and all(w in ACK_WORDS for w in words)
+
+
+def _is_repeat_request(transcript: str) -> bool:
+    """True if the caller is asking to hear the last reply again."""
+    lower = transcript.lower()
+    return any(k in lower for k in REPEAT_KEYWORDS)
+
+
 def _transcribe(pcm: bytes, duration: float) -> tuple[str, str]:
     """Returns (transcript, language_code). language_code is "" on failure."""
     text, language_code = google_transcribe(pcm)
@@ -363,6 +494,11 @@ def _play(wav_bytes: bytes):
 
 def _play_greeting():
     def _go():
+        # Wait for the Bluetooth SCO link to stabilize before playing —
+        # sending audio the instant the call is detected risks the
+        # start of the greeting getting clipped while the link is
+        # still coming up.
+        time.sleep(GREETING_DELAY_SEC)
         wav = _synthesize(GREETING, "en-IN")
         if wav:
             _play(wav)
@@ -468,6 +604,7 @@ def recorder_thread():
 # ─────────────────────────────────────────────────────
 
 def processor_thread():
+    global _last_reply_wav
     log.info("Processor started.")
 
     while not _shutdown.is_set():
@@ -476,30 +613,68 @@ def processor_thread():
         except queue.Empty:
             continue
 
-        transcript, language_code = _transcribe(pcm, duration)
-        if not transcript:
-            continue
+        try:
+            transcript, language_code = _transcribe(pcm, duration)
+            if not transcript:
+                continue
 
-        if _is_self_echo(transcript):
-            continue
+            indic_guess = _detect_indic_language(transcript)
+            if indic_guess and indic_guess != language_code.lower():
+                log.info(
+                    f"[LANG] Overriding STT tag '{language_code}' -> "
+                    f"'{indic_guess}' based on transcript vocabulary"
+                )
+                language_code = indic_guess
 
-        log.info(f"Caller ({language_code}): '{transcript}'")
+            if _is_acknowledgment(transcript):
+                log.info(f"[ACK] '{transcript}' — acknowledgment, no reply needed")
+                continue
 
-        reply, reply_language = _ask(transcript, language_code)
-        if not reply:
-            continue
+            if _is_repeat_request(transcript):
+                with _hist_lock:
+                    wav = _last_reply_wav
+                if wav:
+                    log.info(f"[REPEAT] '{transcript}' — replaying last reply")
+                    if reply_q.full():
+                        try:
+                            reply_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                    reply_q.put(wav)
+                else:
+                    log.info(f"[REPEAT] '{transcript}' — nothing to repeat yet")
+                continue
 
-        wav = _synthesize(reply, reply_language)
-        if not wav:
-            continue
+            if _is_self_echo(transcript):
+                continue
 
-        if reply_q.full():
-            try:
-                reply_q.get_nowait()
-                log.debug("[PROC] Dropped stale reply.")
-            except queue.Empty:
-                pass
-        reply_q.put(wav)
+            log.info(f"Caller ({language_code}): '{transcript}'")
+
+            reply, reply_language = _ask(transcript, language_code)
+            if not reply:
+                continue
+
+            wav = _synthesize(reply, reply_language)
+            if not wav:
+                continue
+
+            with _hist_lock:
+                _last_reply_wav = wav
+
+            if reply_q.full():
+                try:
+                    reply_q.get_nowait()
+                    log.debug("[PROC] Dropped stale reply.")
+                except queue.Empty:
+                    pass
+            reply_q.put(wav)
+
+        except Exception as e:
+            # A single bad turn must never permanently silence the bot
+            # for the rest of the call — daemon threads that raise
+            # unhandled exceptions just die quietly, which is exactly
+            # the "bot goes silent after one turn" failure mode.
+            log.error(f"[PROC] Unhandled error processing turn: {e}", exc_info=True)
 
     log.info("Processor stopped.")
 

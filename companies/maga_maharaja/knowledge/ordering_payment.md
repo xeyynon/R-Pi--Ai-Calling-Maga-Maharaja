@@ -1,5 +1,15 @@
 # Ordering & Payment
 
+## When a Customer Confirms They Want to Order
+
+If the customer says anything indicating they want to place an order
+now (e.g. "I want to order", "book this", "confirm my order", "I'll
+take it"), do NOT try to collect payment on the call itself. Instead
+reply along these lines: we'll message you the payment QR code / UPI
+link on WhatsApp, and once you complete the payment we'll prepare and
+ship your order as soon as possible. Keep it warm and brief, in the
+caller's language.
+
 ## How to Order
 
 Via WhatsApp:
