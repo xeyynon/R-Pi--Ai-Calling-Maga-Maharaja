@@ -25,16 +25,18 @@ from google.genai import types
 
 log = logging.getLogger("llm_gemini")
 
-PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-id-here")
-LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-south1")
-
 _client = None
 
 
 def _get_client():
     global _client
     if _client is None:
-        _client = genai.Client(vertexai=True, project=PROJECT, location=LOCATION)
+        # Read lazily (not at import time) so it picks up whatever
+        # ai_caller_final2.py has set via os.environ.setdefault(),
+        # even though those calls run after this module is imported.
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-id-here")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-south1")
+        _client = genai.Client(vertexai=True, project=project, location=location)
     return _client
 
 

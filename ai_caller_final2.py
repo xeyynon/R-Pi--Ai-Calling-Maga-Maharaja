@@ -66,7 +66,10 @@ os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "asia-south1")
 COMPANY_DIR = Path(__file__).parent / "companies" / "maga_maharaja"
 
 # LLM (Gemini via Vertex AI)
-LLM_MODEL    = "gemini-2.5-flash"   # gemini-2.5-flash-lite for speed, gemini-3-flash for the newer generation
+LLM_MODEL    = "gemini-2.5-flash"   # gemini-2.5-flash-lite would be faster but is not
+                                     # available in asia-south1 (404) for this project —
+                                     # only in us-central1, where the extra India->US
+                                     # round trip would cost more than it saves
 LLM_TOKENS   = 150                  # raised from the old 40-token cap — real replies (pricing tables,
                                      # delivery breakdowns, Telugu/Hindi phrasing) run several sentences
 LLM_TEMP     = 0.5
@@ -112,7 +115,11 @@ HALLUCINATION_PHRASES = (
 # Timing
 WATCHDOG_SEC   = 3     # Bluetooth poll interval
 RECONNECT_SEC  = 2     # wait before reopening stream after call drop
-ECHO_TAIL_SEC  = 0.4   # silence after TTS before mic resumes
+ECHO_TAIL_SEC  = 1.2   # silence after TTS before mic resumes — Bluetooth SCO
+                       # has extra buffering/RF latency beyond what pw-play
+                       # returning implies, so the old 0.4s let the tail end
+                       # of the bot's own reply leak into the mic and get
+                       # transcribed as a new caller utterance
 
 # ─────────────────────────────────────────────────────
 # LOGGING
@@ -250,6 +257,33 @@ def _is_valid(text: str, duration: float) -> bool:
 # ─────────────────────────────────────────────────────
 # STT — Google Cloud Speech-to-Text (multi-language)
 # ─────────────────────────────────────────────────────
+
+def _is_self_echo(transcript: str) -> bool:
+    """
+    Defense-in-depth against Bluetooth SCO echo tail: if the transcript
+    is suspiciously similar to the bot's own last reply, it's more
+    likely a leaked fragment of the TTS playback than a genuine new
+    thing the caller said, so treat it as an echo rather than a turn.
+    """
+    with _hist_lock:
+        last_reply = next(
+            (h["content"] for h in reversed(_history) if h["role"] == "assistant"),
+            None,
+        )
+    if not last_reply:
+        return False
+
+    t_words = set(transcript.lower().split())
+    r_words = set(last_reply.lower().split())
+    if not t_words or not r_words:
+        return False
+
+    overlap = len(t_words & r_words) / len(t_words)
+    if overlap >= 0.6:
+        log.info(f"[ECHO] Discarding likely self-echo ({overlap:.0%} overlap): '{transcript}'")
+        return True
+    return False
+
 
 def _transcribe(pcm: bytes, duration: float) -> tuple[str, str]:
     """Returns (transcript, language_code). language_code is "" on failure."""
@@ -444,6 +478,9 @@ def processor_thread():
 
         transcript, language_code = _transcribe(pcm, duration)
         if not transcript:
+            continue
+
+        if _is_self_echo(transcript):
             continue
 
         log.info(f"Caller ({language_code}): '{transcript}'")
