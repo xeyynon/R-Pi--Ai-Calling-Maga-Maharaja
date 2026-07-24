@@ -1,0 +1,272 @@
+17:26:53 [INFO] AI Caller — Final (Google Cloud edition)
+17:26:53 [INFO] LLM=gemini-2.5-flash | Project=1078973938049 | Location=asia-south1 | User location=India
+17:26:53 [INFO] Company knowledge base: /home/alfaleus/projects/For Customers/companies/maga_maharaja
+17:26:53 [INFO] Watchdog started.
+17:26:53 [INFO] Recorder started.
+17:26:53 [INFO] Processor started.
+17:26:53 [INFO] Playback started.
+17:26:53 [INFO] Ready — waiting for a call. Press Ctrl+C to stop.
+17:26:53 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.34_F0_43_B3_D0_D7.1:input_FL
+17:26:53 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.34_F0_43_B3_D0_D7.1:input_FR
+17:26:53 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:26:53 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:26:53 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:26:53 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:26:53 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.34_F0_43_B3_D0_D7.1:input_FL
+17:26:53 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.34_F0_43_B3_D0_D7.1:input_FR
+17:26:53 [INFO] Call detected — device: Surya's S23 Ultra
+17:26:53 [INFO] History cleared: new call
+17:26:54 [INFO] History cleared: new node bluez_input.34_F0_43_B3_D0_D7.0
+17:26:54 [INFO] Stream open: bluez_input.34_F0_43_B3_D0_D7.0
+17:26:56 [INFO] [TTS] Selected voice for en-IN: en-IN-Chirp3-HD-Achernar
+17:26:58 [INFO] [TTS] (en-IN, 1.45s)
+17:27:10 [INFO] [REC] 2.85s / 64 speech frames
+17:27:13 [INFO] [STT] 'Mujhe Bundi order karna hai' (lang=en-in, 1.72s)
+17:27:13 [INFO] [LANG] Overriding STT tag 'en-in' -> 'hi-in' based on transcript vocabulary
+17:27:13 [INFO] Caller (hi-in): 'Mujhe Bundi order karna hai'
+17:27:13 [INFO] AFC is enabled with max remote calls: 10.
+17:27:17 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:27:17 [INFO] [TTS] Selected voice for hi-IN: hi-IN-Chirp3-HD-Achernar
+17:27:18 [INFO] [TTS] (hi-IN, 1.05s)
+17:27:24 [INFO] [PLAY] 5.85s
+17:27:26 [INFO] [REC] 1.38s / 21 speech frames
+17:27:26 [INFO] [STT] 'Meethi wali' (lang=en-in, 0.90s)
+17:27:26 [INFO] Caller (en-in): 'Meethi wali'
+17:27:26 [INFO] AFC is enabled with max remote calls: 10.
+17:27:28 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:27:28 [INFO] [VALIDATOR] stripped Telugu/Hindi particles from English reply
+17:27:29 [INFO] [TTS] (en-IN, 1.65s)
+17:27:37 [INFO] [PLAY] 7.75s
+17:27:44 [INFO] [REC] 6.81s / 139 speech frames
+17:27:46 [INFO] [STT] 'spicy Mein Kitna spicy ho jaega vo like main Jyada jyada to ITE Vil bi Pro execution for MI' (lang=en-in, 1.74s)
+17:27:46 [INFO] [LANG] Overriding STT tag 'en-in' -> 'hi-in' based on transcript vocabulary
+17:27:46 [INFO] Caller (hi-in): 'spicy Mein Kitna spicy ho jaega vo like main Jyada jyada to ITE Vil bi Pro execution for MI'
+17:27:46 [INFO] AFC is enabled with max remote calls: 10.
+17:27:47 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:27:48 [INFO] [TTS] (hi-IN, 1.55s)
+17:27:56 [INFO] [PLAY] 7.90s
+17:28:00 [INFO] [REC] 2.85s / 66 speech frames
+17:28:02 [INFO] [STT] 'Nahin Agar Mujhe Agar Jyada Teekha khana ho to' (lang=en-in, 1.10s)
+17:28:02 [INFO] [LANG] Overriding STT tag 'en-in' -> 'hi-in' based on transcript vocabulary
+17:28:02 [INFO] Caller (hi-in): 'Nahin Agar Mujhe Agar Jyada Teekha khana ho to'
+17:28:02 [INFO] AFC is enabled with max remote calls: 10.
+17:28:03 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:28:05 [INFO] [TTS] (hi-IN, 2.07s)
+17:28:16 [INFO] [PLAY] 11.29s
+17:28:38 [INFO] [REC] 1.50s / 25 speech frames
+17:28:39 [INFO] [STT] 'Hello hello. Hello hello' (lang=en-in, 1.03s)
+17:28:39 [INFO] Caller (en-in): 'Hello hello. Hello hello'
+17:28:39 [INFO] AFC is enabled with max remote calls: 10.
+17:28:40 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:28:40 [INFO] [VALIDATOR] stripped Telugu/Hindi particles from English reply
+17:28:41 [INFO] [TTS] (en-IN, 1.06s)
+17:28:47 [INFO] [PLAY] 5.98s
+17:29:04 [INFO] [REC] 13.26s / 298 speech frames
+17:29:08 [INFO] [REC] 3.21s / 65 speech frames
+17:29:09 [INFO] [STT] 'ah, like what R D products that Magma Raja sales and an out off D prepare like de do follow d f c c a i rules and all off dait cleaning aur' (lang=en-in, 4.69s)
+17:29:09 [INFO] Caller (en-in): 'ah, like what R D products that Magma Raja sales and an out off D prepare like de do follow d f c c a i rules and all off dait cleaning aur'
+17:29:09 [INFO] AFC is enabled with max remote calls: 10.
+17:29:10 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:29:10 [INFO] [VALIDATOR] stripped Telugu/Hindi particles from English reply
+17:29:12 [INFO] [REC] 3.15s / 59 speech frames
+17:29:14 [INFO] [TTS] (en-IN, 3.49s)
+17:29:15 [INFO] [STT] 'regulatory state government follows' (lang=en-in, 1.36s)
+17:29:15 [INFO] Caller (en-in): 'regulatory state government follows'
+17:29:15 [INFO] AFC is enabled with max remote calls: 10.
+17:29:16 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:29:18 [INFO] [TTS] (en-IN, 1.46s)
+17:29:19 [INFO] [STT] 'aur government allow strictly adar' (lang=en-in, 1.27s)
+17:29:19 [INFO] Caller (en-in): 'aur government allow strictly adar'
+17:29:19 [INFO] AFC is enabled with max remote calls: 10.
+17:29:20 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:29:20 [INFO] [VALIDATOR] stripped Telugu/Hindi particles from English reply
+17:29:21 [INFO] [TTS] (en-IN, 1.08s)
+17:29:33 [INFO] [PLAY] 19.49s
+17:29:42 [INFO] [PLAY] 8.70s
+17:29:48 [INFO] [PLAY] 6.36s
+17:29:50 [INFO] [REC] 1.89s / 38 speech frames
+17:29:52 [INFO] [STT] 'Vansh cricket ine English' (lang=en-in, 1.03s)
+17:29:52 [INFO] Caller (en-in): 'Vansh cricket ine English'
+17:29:52 [INFO] AFC is enabled with max remote calls: 10.
+17:29:52 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:29:53 [INFO] [TTS] (en-IN, 0.93s)
+17:29:59 [INFO] [PLAY] 5.31s
+17:30:11 [INFO] [REC] 11.04s / 228 speech frames
+17:30:14 [INFO] [STT] 'DU u have any certificate prove your validation aur like whatever your cleaning. So dait I can trust U and order anything from an Manga Maharaja' (lang=en-in, 2.72s)
+17:30:14 [INFO] Caller (en-in): 'DU u have any certificate prove your validation aur like whatever your cleaning. So dait I can trust U and order anything from an Manga Maharaja'
+17:30:14 [INFO] AFC is enabled with max remote calls: 10.
+17:30:15 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:30:16 [INFO] [TTS] (en-IN, 1.58s)
+17:30:25 [INFO] [PLAY] 8.40s
+17:30:32 [INFO] [REC] 6.63s / 137 speech frames
+17:30:34 [INFO] [STT] 'To note my number and du text MI aur DU send MI its just available.' (lang=en-in, 1.84s)
+17:30:34 [INFO] Caller (en-in): 'To note my number and du text MI aur DU send MI its just available.'
+17:30:34 [INFO] AFC is enabled with max remote calls: 10.
+17:30:35 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:30:36 [INFO] [TTS] (en-IN, 1.02s)
+17:30:42 [INFO] [PLAY] 5.57s
+17:30:45 [INFO] [REC] 3.72s / 88 speech frames
+17:30:48 [INFO] [STT] 'my number is zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero send ITE' (lang=en-in, 2.21s)
+17:30:48 [INFO] Caller (en-in): 'my number is zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero zero send ITE'
+17:30:48 [INFO] AFC is enabled with max remote calls: 10.
+17:30:49 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:30:50 [INFO] [TTS] (en-IN, 1.34s)
+17:30:57 [INFO] [PLAY] 7.06s
+17:31:02 [INFO] [REC] 2.97s / 61 speech frames
+17:31:04 [INFO] [STT] 'I cannot share my number vid u so' (lang=en-in, 1.24s)
+17:31:04 [INFO] Caller (en-in): 'I cannot share my number vid u so'
+17:31:04 [INFO] AFC is enabled with max remote calls: 10.
+17:31:05 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:31:05 [INFO] [REC] 2.49s / 55 speech frames
+17:31:06 [INFO] [TTS] (en-IN, 1.53s)
+17:31:07 [INFO] [STT] 'Achcha my' (lang=en-in, 1.18s)
+17:31:07 [INFO] Caller (en-in): 'Achcha my'
+17:31:07 [INFO] AFC is enabled with max remote calls: 10.
+17:31:08 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:31:09 [INFO] [TTS] (en-IN, 0.95s)
+17:31:14 [INFO] [PLAY] 8.09s
+17:31:20 [INFO] [PLAY] 5.28s
+17:31:22 [INFO] [REC] 2.76s / 44 speech frames
+17:31:32 [INFO] [REC] 2.04s / 37 speech frames
+17:31:33 [INFO] [STT] 'Thank u for D information.' (lang=en-in, 1.00s)
+17:31:33 [INFO] Caller (en-in): 'Thank u for D information.'
+17:31:33 [INFO] AFC is enabled with max remote calls: 10.
+17:31:34 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:31:35 [INFO] [TTS] (en-IN, 1.17s)
+17:31:41 [INFO] [PLAY] 6.56s
+17:31:56 [INFO] [REC] 4.56s / 99 speech frames
+17:31:58 [INFO] [STT] 'So how Meni days can I store whatever u products u r building?' (lang=en-in, 1.52s)
+17:31:58 [INFO] Caller (en-in): 'So how Meni days can I store whatever u products u r building?'
+17:31:58 [INFO] AFC is enabled with max remote calls: 10.
+17:31:59 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:32:01 [INFO] [TTS] (en-IN, 1.99s)
+17:32:13 [INFO] [PLAY] 11.76s
+17:32:38 [INFO] [REC] 2.28s / 24 speech frames
+17:32:39 [INFO] [STT] 'Hello.' (lang=en-in, 1.09s)
+17:32:39 [INFO] Caller (en-in): 'Hello.'
+17:32:39 [INFO] AFC is enabled with max remote calls: 10.
+17:32:40 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:32:40 [INFO] [TTS] (en-IN, 0.71s)
+17:32:44 [INFO] [PLAY] 3.45s
+17:32:50 [INFO] [REC] 6.66s / 149 speech frames
+17:32:52 [INFO] [STT] 'so u r talking about something but deyar due Tu D network issue have not able Tu understand please keep ITE dait ine Telugu' (lang=en-in, 2.06s)
+17:32:52 [INFO] Caller (en-in): 'so u r talking about something but deyar due Tu D network issue have not able Tu understand please keep ITE dait ine Telugu'
+17:32:52 [INFO] AFC is enabled with max remote calls: 10.
+17:32:54 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:32:54 [INFO] [VALIDATOR] stripped Telugu/Hindi particles from English reply
+17:32:56 [INFO] [TTS] (en-IN, 1.80s)
+17:33:06 [INFO] [PLAY] 10.41s
+17:33:18 [INFO] [REC] 11.07s / 225 speech frames
+17:33:20 [INFO] [STT] 'An Mujhe Telugu samajh Nahin a rahi hai lekin aapane Kuchh To product ke bare mein Bata rahe the to vah mujhe to Bator rahega.' (lang=en-in, 2.87s)
+17:33:20 [INFO] [LANG] Overriding STT tag 'en-in' -> 'hi-in' based on transcript vocabulary
+17:33:20 [INFO] Caller (hi-in): 'An Mujhe Telugu samajh Nahin a rahi hai lekin aapane Kuchh To product ke bare mein Bata rahe the to vah mujhe to Bator rahega.'
+17:33:20 [INFO] AFC is enabled with max remote calls: 10.
+17:33:22 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:33:25 [INFO] [TTS] (hi-IN, 3.15s)
+17:33:42 [INFO] [PLAY] 16.59s
+17:33:44 [INFO] [REC] 2.31s / 45 speech frames
+17:33:45 [INFO] [STT] 'Achcha refund policy kya hai aapki?' (lang=en-in, 0.95s)
+17:33:45 [INFO] [LANG] Overriding STT tag 'en-in' -> 'hi-in' based on transcript vocabulary
+17:33:45 [INFO] Caller (hi-in): 'Achcha refund policy kya hai aapki?'
+17:33:45 [INFO] AFC is enabled with max remote calls: 10.
+17:33:47 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:33:49 [INFO] [TTS] (hi-IN, 2.16s)
+17:34:01 [INFO] [PLAY] 12.06s
+17:34:13 [INFO] [REC] 12.30s / 273 speech frames
+17:34:15 [INFO] [REC] 2.10s / 34 speech frames
+17:34:16 [INFO] [STT] 'Nahin Agar Mujhe replacement karna hi nahin hai mujhe like paise Mujhe Wapas chahie to kitne din Lagte Hain Jisko complete hone mein agar matlab Jis tarike Se Maine pay Kiya' (lang=en-in, 2.90s)
+17:34:16 [INFO] [LANG] Overriding STT tag 'en-in' -> 'hi-in' based on transcript vocabulary
+17:34:16 [INFO] Caller (hi-in): 'Nahin Agar Mujhe replacement karna hi nahin hai mujhe like paise Mujhe Wapas chahie to kitne din Lagte Hain Jisko complete hone mein agar matlab Jis tarike Se Maine pay Kiya'
+17:34:16 [INFO] AFC is enabled with max remote calls: 10.
+17:34:17 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:34:20 [INFO] [TTS] (hi-IN, 2.38s)
+17:34:21 [INFO] [STT] 'Is tarike Se Wapas aata hai ya sar?' (lang=en-in, 1.12s)
+17:34:21 [INFO] [LANG] Overriding STT tag 'en-in' -> 'hi-in' based on transcript vocabulary
+17:34:21 [INFO] Caller (hi-in): 'Is tarike Se Wapas aata hai ya sar?'
+17:34:21 [INFO] AFC is enabled with max remote calls: 10.
+17:34:22 [INFO] HTTP Request: POST https://asia-south1-aiplatform.googleapis.com/v1beta1/projects/1078973938049/locations/asia-south1/publishers/google/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+17:34:24 [INFO] [TTS] (hi-IN, 1.92s)
+17:34:33 [INFO] [PLAY] 13.23s
+17:34:37 [INFO] Node changed — reopening stream.
+17:34:37 [INFO] Stream closed.
+17:34:39 [INFO] Call ended.
+17:34:39 [INFO] History cleared: call ended
+17:34:44 [INFO] [PLAY] 11.07s
+17:35:02 [INFO] History cleared: new node bluez_input.34_F0_43_B3_D0_D7.2
+17:35:02 [INFO] Stream open: bluez_input.34_F0_43_B3_D0_D7.2
+17:35:05 [INFO] Node changed — reopening stream.
+17:35:05 [INFO] Stream closed.
+17:35:06 [INFO] Shutting down...
+17:35:06 [INFO] Watchdog stopped.
+17:35:07 [INFO] Recorder stopped.
+17:35:07 [INFO] Processor stopped.
+17:35:07 [INFO] Playback stopped.
+17:35:07 [INFO] Done.
+17:37:01 [INFO] AI Caller — Final (Google Cloud edition)
+17:37:01 [INFO] LLM=gemini-2.5-flash | Project=1078973938049 | Location=asia-south1 | User location=India
+17:37:01 [INFO] Company knowledge base: /home/alfaleus/projects/For Customers/companies/maga_maharaja
+17:37:01 [INFO] Watchdog started.
+17:37:01 [INFO] Recorder started.
+17:37:01 [INFO] Processor started.
+17:37:01 [INFO] Playback started.
+17:37:01 [INFO] Ready — waiting for a call. Press Ctrl+C to stop.
+17:37:32 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FL
+17:37:32 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FR
+17:37:32 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:37:32 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:37:32 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:37:32 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:37:32 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FL
+17:37:32 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FR
+17:37:32 [INFO] Call detected — device: REDMI Turbo 5, Surya's S23 Ultra
+17:37:32 [INFO] History cleared: new call
+17:37:32 [INFO] History cleared: new node bluez_input.D8_E3_74_5F_BA_A3.0
+17:37:32 [INFO] Stream open: bluez_input.D8_E3_74_5F_BA_A3.0
+17:37:35 [INFO] [TTS] Selected voice for en-IN: en-IN-Chirp3-HD-Achernar
+17:37:36 [INFO] [TTS] (en-IN, 1.46s)
+17:37:50 [INFO] Node changed — reopening stream.
+17:37:50 [INFO] Stream closed.
+17:37:53 [INFO] Call ended.
+17:37:53 [INFO] History cleared: call ended
+17:39:01 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FL
+17:39:01 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FR
+17:39:01 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:39:01 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:39:01 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:39:01 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:39:01 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FL
+17:39:01 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FR
+17:39:01 [INFO] Call detected — device: REDMI Turbo 5, Surya's S23 Ultra
+17:39:01 [INFO] History cleared: new call
+17:39:01 [INFO] Stream open: bluez_input.D8_E3_74_5F_BA_A3.0
+17:39:03 [INFO] [TTS] (en-IN, 1.56s)
+17:39:08 [INFO] Node changed — reopening stream.
+17:39:08 [INFO] Stream closed.
+17:39:10 [INFO] Call ended.
+17:39:10 [INFO] History cleared: call ended
+17:39:20 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.34_F0_43_B3_D0_D7.1:input_FL
+17:39:20 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.34_F0_43_B3_D0_D7.1:input_FR
+17:39:20 [INFO] History cleared: new node bluez_input.34_F0_43_B3_D0_D7.0
+17:39:20 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:39:20 [INFO] Stream open: bluez_input.34_F0_43_B3_D0_D7.0
+17:39:20 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:39:20 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:39:20 [INFO] [AUDIO] Cut loopback link: bluez_input.34_F0_43_B3_D0_D7.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:39:20 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.34_F0_43_B3_D0_D7.1:input_FL
+17:39:20 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.34_F0_43_B3_D0_D7.1:input_FR
+17:39:20 [INFO] Call detected — device: REDMI Turbo 5, Surya's S23 Ultra
+17:39:20 [INFO] History cleared: new call
+17:39:21 [INFO] [TTS] (en-IN, 1.45s)
+17:39:23 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FL
+17:39:23 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FR
+17:39:23 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:39:23 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:39:23 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FL -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FL
+17:39:23 [INFO] [AUDIO] Cut loopback link: bluez_input.D8_E3_74_5F_BA_A3.0:output_FR -> alsa_output.platform-fe00b840.mailbox.stereo-fallback:playback_FR
+17:39:23 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FL -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FL
+17:39:23 [INFO] [AUDIO] Cut loopback link: alsa_output.platform-fe00b840.mailbox.stereo-fallback:monitor_FR -> bluez_output.D8_E3_74_5F_BA_A3.1:input_FR
+17:39:58 [INFO] [REC] 1.89s / 21 speech frames
+17:40:00 [INFO] Node changed — reopening stream.
+17:40:00 [INFO] Stream closed.
+17:40:03 [INFO] Call ended.
+17:40:03 [INFO] History cleared: call ended

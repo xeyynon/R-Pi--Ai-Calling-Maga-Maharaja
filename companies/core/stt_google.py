@@ -16,6 +16,8 @@ import time
 
 from google.cloud import speech
 
+from .retry import with_retry
+
 log = logging.getLogger("stt_google")
 
 # Candidate languages for auto-detection. Order matters slightly —
@@ -25,6 +27,13 @@ LANGUAGE_CODE = "en-IN"
 ALTERNATIVE_LANGUAGE_CODES = ["te-IN", "hi-IN"]
 
 SAMPLE_RATE = 16000  # must match ai_caller_final2.py's SAMPLE_RATE
+
+# Without an explicit deadline, a stalled network request can block
+# this call forever without ever raising — with_retry() can't help
+# against that since it only retries on an actual exception. Real
+# calls finish in a few seconds, so this is generous headroom, not a
+# tight budget.
+REQUEST_TIMEOUT_SEC = 20
 
 _client = None
 
@@ -40,9 +49,13 @@ def transcribe(pcm: bytes) -> tuple[str, str]:
     """
     Transcribes raw 16kHz mono s16 PCM audio.
 
-    Returns (transcript, language_code). language_code will be one of
-    "en-IN", "te-IN", "hi-IN" (whichever Google detected), or ""
-    on failure / no speech recognized.
+    Returns (transcript, language_code):
+    - Real speech recognized: (text, one of "en-IN"/"te-IN"/"hi-IN")
+    - Google STT ran fine but found no speech (silence/noise — the
+      normal, frequent case): ("", "")
+    - Google STT itself failed after retries (network/auth/etc — rare):
+      ("", "ERROR"), so callers can tell "nothing to say" apart from
+      "something went wrong" instead of treating both as silence.
     """
     client = _get_client()
 
@@ -60,11 +73,13 @@ def transcribe(pcm: bytes) -> tuple[str, str]:
 
     try:
         t0 = time.time()
-        response = client.recognize(config=config, audio=audio)
+        response = with_retry(lambda: client.recognize(
+            config=config, audio=audio, timeout=REQUEST_TIMEOUT_SEC
+        ))
         elapsed = time.time() - t0
     except Exception as e:
         log.error(f"[STT] Google Speech-to-Text failed: {e}")
-        return "", ""
+        return "", "ERROR"
 
     if not response.results:
         log.debug("[STT] No speech recognized.")

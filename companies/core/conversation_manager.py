@@ -54,8 +54,13 @@ class ConversationManager:
         key = (detected_language or "en-in").lower()
         return self.fallback_messages.get(key, self.fallback_messages["en-in"])
 
-    def _build_system_prompt(self, context: str, knowledge: str, detected_language: str) -> str:
+    def _build_system_prompt(self, context: str, knowledge: str, detected_language: str, is_first_turn: bool) -> str:
         parts = [self.base_prompt]
+
+        if is_first_turn:
+            parts.append("This is the first message of the call — the automatic greeting has already been spoken.")
+        else:
+            parts.append("This is a continuing conversation, not the start of the call — do not greet again.")
 
         if detected_language:
             parts.append(f"The caller's detected language is: {detected_language}.")
@@ -79,8 +84,10 @@ class ConversationManager:
         detected_language so the caller can be answered in the
         language they used.
         """
+        is_first_turn = not recent_history
+
         knowledge = get_relevant_context(self.company_dir, transcript)
-        system_prompt = self._build_system_prompt(context, knowledge, detected_language)
+        system_prompt = self._build_system_prompt(context, knowledge, detected_language, is_first_turn)
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(recent_history)
@@ -93,6 +100,11 @@ class ConversationManager:
             temperature=self.temperature,
         )
 
-        reply = validate_reply(reply, self._fallback_for(detected_language))
+        reply = validate_reply(
+            reply,
+            self._fallback_for(detected_language),
+            is_first_turn,
+            language_code=detected_language or "",
+        )
 
         return reply, detected_language or "en-IN"

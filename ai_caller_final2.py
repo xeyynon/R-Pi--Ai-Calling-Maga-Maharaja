@@ -3,37 +3,39 @@
 AI Caller — Final (Google Cloud edition)
 -----------------------------------------
 Bluetooth HFP/SCO -> WebRTC VAD -> Google Speech-to-Text (multi-language)
-    -> Conversation Manager (intent + knowledge + Gemini LLM + validator)
+    -> Conversation Manager (knowledge retrieval + Gemini LLM + validator)
     -> Google Text-to-Speech (language-matched voice) -> Bluetooth
 
-Swapped from the original Groq-based pipeline to Google Cloud APIs
-(company requirement). See core/stt_google.py, core/tts_google.py,
-core/llm_gemini.py for the replaced pieces. Bluetooth handling, VAD,
-hallucination filtering, echo cancellation, and the Conversation
-Manager (intent classification / knowledge retrieval / validator) are
-all unchanged from the Groq version.
+Runs on Google Cloud APIs (company requirement). See
+companies/core/stt_google.py, companies/core/tts_google.py,
+companies/core/llm_gemini.py for those pieces.
 
 Features:
 - Persistent pw-record (no Bluetooth crashes)
 - Dynamic Bluetooth (any device, no hardcoded MAC)
-- Echo cancellation (mic pauses during TTS playback)
-- Multi-layer hallucination filter (energy, VAD, ASCII ratio relaxed
-  for non-English, words/sec)
+- Echo cancellation (mic pauses during TTS playback) plus active
+  removal of PipeWire's Bluetooth HFP <-> onboard-audio loopback links
+- Multi-layer hallucination filter (energy, VAD, words/sec)
 - Per-call history reset (on connect, disconnect, device change)
 - Automatic language detection (English/Telugu/Hindi) via Google STT,
-  carried through to the LLM reply language and the TTS voice
+  corrected by a local vocabulary heuristic where STT's tag is
+  unreliable, carried through to the LLM reply language and TTS voice
 - Location + time context injected into every LLM call
-- Intent classification + scoped knowledge retrieval + reply validation
-- Greeting on call start
+- Scoped knowledge retrieval (no separate intent-classification call)
+  + reply validation
+- Greeting on call start, delayed to let the Bluetooth link stabilize
 - Continuous recording loop (doesn't stop after first utterance)
 - eSpeak fallback if Google TTS fails
 - Graceful shutdown on Ctrl+C
 """
 
+import array
 import logging
+import logging.handlers
 import os
 import queue
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -42,7 +44,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pytz
 import webrtcvad
 
@@ -77,7 +78,7 @@ LLM_HISTORY  = 3   # past exchanges to keep in context
 
 # User context
 USER_TIMEZONE = "Asia/Kolkata"
-USER_LOCATION = "Hyderabad, Telangana, India"
+USER_LOCATION = "India"
 
 # Greeting — spoken in English at the start of every call (per the
 # always-on language rules: always start in English, switch only
@@ -86,6 +87,11 @@ GREETING = (
     "Hello! Welcome to Maga Maharaja Foods. I might take a few seconds "
     "to answer, so please bear with me. How can I help you today?"
 )
+
+# Spoken only when Google Speech-to-Text itself fails (network/auth
+# error, distinct from normal silence/noise) — English only, since the
+# caller's language isn't known when STT couldn't run at all.
+STT_ERROR_MESSAGE = "Sorry, I didn't catch that. Could you please repeat?"
 
 # VAD / Audio
 SAMPLE_RATE       = 16000
@@ -108,6 +114,10 @@ MIN_WORDS_PER_SEC = 0.4    # below this = noise hallucination
 # one of these is confirming they heard the last reply, not asking a
 # new question. Recognizing them here means we don't burn a Gemini
 # call (and don't speak again) for a bare "ok"/"hmm"/"achha".
+# NOTE: overlaps with HINDI_MARKERS/TELUGU_MARKERS below by design —
+# those two sets serve different purposes (is this an acknowledgment?
+# vs. which language is this?), not duplicated logic, so a word can
+# legitimately belong in both.
 ACK_WORDS = {
     "ok", "okay", "k", "hmm", "hm", "mm", "mhm", "uh", "uhu", "yeah", "yep",
     "yes", "alright", "sure", "fine", "cool", "great", "thanks", "thank",
@@ -125,6 +135,35 @@ REPEAT_KEYWORDS = (
     "phir se", "dobara", "dubara",                             # Hindi
 )
 
+# A caller saying one of these (alone, or as part of a short phrase)
+# wants the bot to pause/stop, not answer a new question — e.g. they
+# got frustrated, or need a moment. This is recognized BETWEEN turns
+# (the next thing the caller says once the mic is listening again),
+# not mid-sentence while the bot is speaking — the mic is deliberately
+# muted during playback to prevent the Bluetooth echo/loopback bugs
+# fixed earlier, so true "cut the bot off mid-word" interruption isn't
+# possible without reopening that problem.
+STOP_WORDS = {
+    "stop", "wait", "hold", "pause",
+    "ruk", "ruko", "rukja", "bas",                      # Hindi
+    "aagu", "aapu", "niluvu", "aagandi", "apu",          # Telugu
+}
+STOP_KEYWORDS = (
+    "stop talking", "wait a", "hold on", "one second", "one minute",
+    "give me a second", "give me a minute",
+    "ruk ja", "thoda ruko", "ek minute", "ek second",           # Hindi
+    "konchem aagu", "oka nimisham", "aagandi konchem",          # Telugu
+)
+
+# Short, respectful acknowledgment — no Gemini call needed, same
+# reasoning as ACK_WORDS: this is a meta-conversational signal, not a
+# question that needs the knowledge base.
+STOP_RESPONSES = {
+    "en-in": "Sure, I'll pause. Let me know when you're ready.",
+    "hi-in": "Theek hai, main rukti hoon. Jab aap taiyar hain batayiye.",
+    "te-in": "Sare andi, nenu aagutanu. Meeru ready ayyaka cheppandi.",
+}
+
 # Google STT's language auto-detection is unreliable for romanized
 # Hindi/Telugu — genuine Hindi speech has been observed tagged as
 # "en-in". Since that tag gets passed to the LLM as a stated fact
@@ -138,6 +177,8 @@ HINDI_MARKERS = {
     "hoon", "tha", "thi", "nahi", "haan", "kaise", "kitna", "kitne",
     "mera", "meri", "tumhe", "aapko", "dijiye", "batao", "bataiye",
     "kar", "raha", "rahi", "chahiyen", "acha", "achha", "theek", "hain",
+    "gaya", "gayi", "karun", "hua", "hui", "matlab", "bhai", "abhi",
+    "yahan", "wahan", "toh", "isliye", "lagta",
 }
 TELUGU_MARKERS = {
     "andi", "meeku", "meeru", "kavala", "kavali", "entha", "enti",
@@ -165,12 +206,11 @@ def _detect_indic_language(transcript: str) -> str | None:
 
 
 # Hallucination filter
-# NOTE: the old ASCII_RATIO_MIN=0.85 check has been REMOVED — it would
-# reject genuine Telugu/Hindi speech transcribed in native script.
-# Google STT can return Telugu in Telugu script depending on config;
-# since we want Tenglish/Hinglish (English script) for the LLM and TTS
-# prompt consistency, non-ASCII results are transliterated rather than
-# rejected — see _maybe_transliterate() below.
+# No ASCII-ratio check here — Telugu/Hindi speech transcribed in
+# native (non-Latin) script is valid, not noise. Keeping LLM replies
+# and TTS in Latin/romanized script regardless of the caller's script
+# is enforced in the prompt (see always_on.md's language rules), not
+# by rejecting/transliterating STT output here.
 HALLUCINATION_PHRASES = (
     "thank you for watching", "please subscribe", "like and subscribe",
     "subtitles by", "transcribed by", "www.", ".com", "♪", "♫",
@@ -178,24 +218,46 @@ HALLUCINATION_PHRASES = (
 )
 
 # Timing
-GREETING_DELAY_SEC = 1.0  # wait after call connects before speaking the
-                           # greeting, so the SCO link has time to stabilize
+GREETING_DELAY_SEC = 0  # removed per request — was 1.0s to let the SCO
+                         # link stabilize before speaking; if the greeting's
+                         # opening word(s) come out clipped on real calls,
+                         # that's the trade-off of setting this back to 0
 WATCHDOG_SEC   = 3     # Bluetooth poll interval
+CALL_END_DEBOUNCE_POLLS = 2  # consecutive missed polls (~2*WATCHDOG_SEC)
+                              # before believing a call really ended, not
+                              # just a transient Bluetooth node blip
 RECONNECT_SEC  = 2     # wait before reopening stream after call drop
 ECHO_TAIL_SEC  = 1.2   # silence after TTS before mic resumes — Bluetooth SCO
                        # has extra buffering/RF latency beyond what pw-play
                        # returning implies, so the old 0.4s let the tail end
                        # of the bot's own reply leak into the mic and get
                        # transcribed as a new caller utterance
+PW_PLAY_TIMEOUT_SEC  = 45  # bounds pw-play so a stalled Bluetooth link can't
+                           # hang playback forever (longest observed real
+                           # reply playback was ~29s, so this leaves margin)
+READ_TIMEOUT_SEC     = 5   # bounds each pw-record read so a stalled stream
+                           # can't hang the recorder forever mid-call
 
 # ─────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+_LOG_FORMAT = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
 )
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_LOG_FORMAT)
+
+# Rotating file handler — logs include caller transcripts, so keep
+# them bounded rather than growing unbounded on the Pi's SD card.
+# 5MB x 3 backups = 15MB cap, plenty for debugging recent calls.
+_file_handler = logging.handlers.RotatingFileHandler(
+    Path(__file__).parent / "ai_caller.log",
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+)
+_file_handler.setFormatter(_LOG_FORMAT)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
 log = logging.getLogger("ai_caller")
 
 # ─────────────────────────────────────────────────────
@@ -214,7 +276,8 @@ _history    = []
 _conv_mgr   = None   # ConversationManager instance, set in main()
 _vad        = webrtcvad.Vad(VAD_MODE)
 
-_last_reply_wav = None   # cached audio of the last spoken reply, for "repeat please"
+_last_reply_wav  = None   # cached audio of the last spoken reply, for "repeat please"
+_last_reply_lang = None   # language that reply was actually spoken in
 
 audio_q     = queue.Queue(maxsize=3)
 reply_q     = queue.Queue(maxsize=3)
@@ -293,39 +356,64 @@ def _device_name():
 
 
 def _clear_history(reason=""):
-    global _last_reply_wav
+    global _last_reply_wav, _last_reply_lang
     with _hist_lock:
         _history.clear()
         _last_reply_wav = None
+        _last_reply_lang = None
     log.info(f"History cleared{': ' + reason if reason else '.'}")
 
 
 def watchdog_thread():
     global _inp_node, _out_node
     had_call = False
+    missing_polls = 0
     log.info("Watchdog started.")
 
     while not _shutdown.is_set():
-        inp, out = _find_nodes()
-        with _node_lock:
-            _inp_node = inp
-            _out_node = out
+        try:
+            inp, out = _find_nodes()
+            with _node_lock:
+                _inp_node = inp
+                _out_node = out
 
-        call_now = bool(inp and out)
+            call_now = bool(inp and out)
 
-        if call_now:
-            _kill_loopback_links()
+            if call_now:
+                _kill_loopback_links()
+                missing_polls = 0
 
-        if call_now and not had_call:
-            log.info(f"Call detected — device: {_device_name()}")
-            _clear_history("new call")
-            _play_greeting()
+            if call_now and not had_call:
+                log.info(f"Call detected — device: {_device_name()}")
+                _clear_history("new call")
+                _play_greeting()
+                had_call = True
 
-        elif had_call and not call_now:
-            log.info("Call ended.")
-            _clear_history("call ended")
+            elif had_call and not call_now:
+                # Debounced: right as a Bluetooth SCO link comes up or
+                # tears down, wpctl can transiently miss one of the two
+                # nodes for a single poll. Treating that single miss as
+                # "call ended" immediately made the very next poll look
+                # like a brand-new call, re-triggering the greeting —
+                # the repeated-greeting bug. Require the nodes to stay
+                # absent for CALL_END_DEBOUNCE_POLLS in a row before
+                # believing the call actually ended.
+                missing_polls += 1
+                if missing_polls >= CALL_END_DEBOUNCE_POLLS:
+                    log.info("Call ended.")
+                    _clear_history("call ended")
+                    had_call = False
+                    missing_polls = 0
 
-        had_call = call_now
+        except Exception as e:
+            # Same failure mode as the processor_thread fix: a daemon
+            # thread that raises unhandled just dies silently. Here
+            # that would permanently stop call detection, greetings,
+            # and Bluetooth loopback cleanup for the rest of the
+            # process's life — worth guarding even though none of the
+            # functions above are currently known to raise.
+            log.error(f"[WATCHDOG] Unhandled error: {e}", exc_info=True)
+
         _shutdown.wait(WATCHDOG_SEC)
 
     log.info("Watchdog stopped.")
@@ -336,7 +424,9 @@ def watchdog_thread():
 # ─────────────────────────────────────────────────────
 
 def _energy(chunk: bytes) -> float:
-    return float(np.abs(np.frombuffer(chunk, dtype=np.int16)).mean())
+    samples = array.array("h")
+    samples.frombytes(chunk)
+    return sum(abs(s) for s in samples) / len(samples)
 
 
 def _is_speech(chunk: bytes) -> bool:
@@ -377,12 +467,26 @@ def _is_valid(text: str, duration: float) -> bool:
 # STT — Google Cloud Speech-to-Text (multi-language)
 # ─────────────────────────────────────────────────────
 
+MIN_ECHO_CHECK_WORDS = 4   # below this, don't even consider self-echo (see below)
+ECHO_OVERLAP_THRESHOLD = 0.85  # raised from 0.6 — see below
+
+
 def _is_self_echo(transcript: str) -> bool:
     """
     Defense-in-depth against Bluetooth SCO echo tail: if the transcript
     is suspiciously similar to the bot's own last reply, it's more
     likely a leaked fragment of the TTS playback than a genuine new
     thing the caller said, so treat it as an echo rather than a turn.
+
+    A short, topically-related utterance (e.g. the caller saying
+    "Hindi mein baat karo" right after the bot's reply happened to
+    mention switching to Hindi) can hit 60%+ word overlap purely by
+    coincidence, not because it's an echo — with few words, a couple
+    of shared ones is a high ratio. Genuine acoustic echo is a near-
+    verbatim fragment, so it reliably scores much higher than that.
+    Short filler ("ok", "stop", "repeat") is already handled by
+    ACK_WORDS/STOP_WORDS/REPEAT_KEYWORDS before this ever runs, so
+    requiring more words here doesn't miss those cases.
     """
     with _hist_lock:
         last_reply = next(
@@ -392,13 +496,15 @@ def _is_self_echo(transcript: str) -> bool:
     if not last_reply:
         return False
 
-    t_words = set(transcript.lower().split())
-    r_words = set(last_reply.lower().split())
-    if not t_words or not r_words:
+    # Punctuation-stripped word extraction (not .split()) so "hai,"/
+    # "hoon." in the reply still match "hai"/"hoon" in the transcript.
+    t_words = set(re.findall(r"\w+", transcript.lower()))
+    r_words = set(re.findall(r"\w+", last_reply.lower()))
+    if len(t_words) < MIN_ECHO_CHECK_WORDS or not r_words:
         return False
 
     overlap = len(t_words & r_words) / len(t_words)
-    if overlap >= 0.6:
+    if overlap >= ECHO_OVERLAP_THRESHOLD:
         log.info(f"[ECHO] Discarding likely self-echo ({overlap:.0%} overlap): '{transcript}'")
         return True
     return False
@@ -416,9 +522,49 @@ def _is_repeat_request(transcript: str) -> bool:
     return any(k in lower for k in REPEAT_KEYWORDS)
 
 
+def _is_stop_request(transcript: str) -> bool:
+    """True if the caller wants the bot to pause/stop, not answer a new question."""
+    words = re.findall(r"\w+", transcript.lower())
+    if words and all(w in STOP_WORDS for w in words):
+        return True
+    lower = transcript.lower()
+    return any(k in lower for k in STOP_KEYWORDS)
+
+
+LANGUAGE_NAMES = {"en-in": "English", "hi-in": "Hindi", "te-in": "Telugu"}
+
+
+def _extract_requested_language(transcript: str) -> str | None:
+    """
+    If a "repeat" request also names a specific language (e.g. "repeat
+    that in Hindi", "Hindi mein bolo"), returns that language's code.
+    Without this, a caller asking to hear the same content in a
+    DIFFERENT language than it was already spoken in would just get
+    the cached audio replayed verbatim, in the wrong language, no
+    matter how many times they ask.
+    """
+    lower = transcript.lower()
+    if "hindi" in lower:
+        return "hi-in"
+    if "telugu" in lower:
+        return "te-in"
+    if "english" in lower:
+        return "en-in"
+    return None
+
+
 def _transcribe(pcm: bytes, duration: float) -> tuple[str, str]:
-    """Returns (transcript, language_code). language_code is "" on failure."""
+    """
+    Returns (transcript, language_code).
+    language_code == "ERROR" means Google STT itself failed (rare) —
+    distinct from "" which means STT ran fine but found no valid
+    speech (silence/noise/hallucination-filtered — the normal case,
+    which should stay silent, not trigger an apology).
+    """
     text, language_code = google_transcribe(pcm)
+
+    if language_code == "ERROR":
+        return "", "ERROR"
 
     if not _is_valid(text, duration):
         return "", ""
@@ -427,7 +573,7 @@ def _transcribe(pcm: bytes, duration: float) -> tuple[str, str]:
 
 # ─────────────────────────────────────────────────────
 # LLM — routed through the Conversation Manager (Gemini backend)
-# (intent classification -> knowledge lookup -> Gemini -> validator)
+# (knowledge lookup -> Gemini -> validator)
 # ─────────────────────────────────────────────────────
 
 def _ask(transcript: str, language_code: str) -> tuple[str, str]:
@@ -486,8 +632,17 @@ def _play(wav_bytes: bytes):
             input=wav_bytes,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=PW_PLAY_TIMEOUT_SEC,
         )
         time.sleep(ECHO_TAIL_SEC)
+    except subprocess.TimeoutExpired:
+        # Without a timeout here, a stalled Bluetooth link would block
+        # this call forever — and since nothing else in the pipeline
+        # can un-stick a hung subprocess.run(), that's a silent,
+        # permanent loss of all further replies for the rest of the
+        # call (a hang, not an exception, so earlier try/except
+        # guards elsewhere don't help against this specific failure).
+        log.error(f"[PLAY] pw-play timed out after {PW_PLAY_TIMEOUT_SEC}s — killed.")
     finally:
         _playing.clear()
 
@@ -510,6 +665,33 @@ def _play_greeting():
 # One persistent pw-record per call session
 # Resets after each utterance — never closes mid-call
 # ─────────────────────────────────────────────────────
+
+def _read_frame(proc, size: int, timeout_sec: float) -> bytes:
+    """
+    Reads exactly `size` bytes from proc.stdout, bounded by
+    `timeout_sec`. A plain blocking .read() has no timeout — if
+    pw-record ever stalls mid-call without closing its pipe, that
+    would hang this thread forever with no way to recover (same class
+    of hang as the unbounded pw-play call in _play()). Returns fewer
+    than `size` bytes (possibly empty) on timeout or EOF, so the
+    existing "len(chunk) < FRAME_BYTES" check already treats either
+    case as a stream to be reopened.
+    """
+    buf = bytearray()
+    deadline = time.time() + timeout_sec
+    while len(buf) < size:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return bytes(buf)
+        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not ready:
+            return bytes(buf)
+        chunk = os.read(proc.stdout.fileno(), size - len(buf))
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+    return bytes(buf)
+
 
 def recorder_thread():
     global _call_node
@@ -546,7 +728,7 @@ def recorder_thread():
                         log.info("Node changed — reopening stream.")
                         break
 
-                chunk = proc.stdout.read(FRAME_BYTES)
+                chunk = _read_frame(proc, FRAME_BYTES, READ_TIMEOUT_SEC)
                 if len(chunk) < FRAME_BYTES:
                     log.warning("Stream ended unexpectedly.")
                     break
@@ -604,7 +786,7 @@ def recorder_thread():
 # ─────────────────────────────────────────────────────
 
 def processor_thread():
-    global _last_reply_wav
+    global _last_reply_wav, _last_reply_lang
     log.info("Processor started.")
 
     while not _shutdown.is_set():
@@ -616,6 +798,16 @@ def processor_thread():
         try:
             transcript, language_code = _transcribe(pcm, duration)
             if not transcript:
+                if language_code == "ERROR":
+                    log.warning("[STT] Google STT failed — speaking apology")
+                    wav = _synthesize(STT_ERROR_MESSAGE, "en-IN")
+                    if wav:
+                        if reply_q.full():
+                            try:
+                                reply_q.get_nowait()
+                            except queue.Empty:
+                                pass
+                        reply_q.put(wav)
                 continue
 
             indic_guess = _detect_indic_language(transcript)
@@ -630,10 +822,61 @@ def processor_thread():
                 log.info(f"[ACK] '{transcript}' — acknowledgment, no reply needed")
                 continue
 
+            if _is_stop_request(transcript):
+                lang_key = language_code.lower() if language_code else "en-in"
+                response_text = STOP_RESPONSES.get(lang_key, STOP_RESPONSES["en-in"])
+                log.info(f"[STOP] '{transcript}' — pausing, respectful ack ({lang_key})")
+                wav = _synthesize(response_text, lang_key)
+                if wav:
+                    with _hist_lock:
+                        _last_reply_wav = wav
+                        _last_reply_lang = lang_key
+                    if reply_q.full():
+                        try:
+                            reply_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                    reply_q.put(wav)
+                continue
+
             if _is_repeat_request(transcript):
+                requested_lang = _extract_requested_language(transcript)
+
                 with _hist_lock:
                     wav = _last_reply_wav
-                if wav:
+                    last_lang = _last_reply_lang
+                    last_reply_text = next(
+                        (h["content"] for h in reversed(_history) if h["role"] == "assistant"),
+                        None,
+                    )
+
+                if requested_lang and requested_lang != (last_lang or "").lower() and last_reply_text:
+                    # Caller wants the same content in a DIFFERENT
+                    # language than it was last spoken in — replaying
+                    # the cached audio would just repeat the same
+                    # words in the wrong language, no matter how many
+                    # times they ask (this is the exact bug that was
+                    # happening before this fix).
+                    lang_name = LANGUAGE_NAMES.get(requested_lang, requested_lang)
+                    log.info(f"[REPEAT] '{transcript}' — re-speaking last reply in {lang_name}")
+                    translate_request = (
+                        f"Please say your previous answer again, in {lang_name} this time: "
+                        f"\"{last_reply_text}\""
+                    )
+                    reply, reply_language = _ask(translate_request, requested_lang)
+                    if reply:
+                        new_wav = _synthesize(reply, reply_language)
+                        if new_wav:
+                            with _hist_lock:
+                                _last_reply_wav = new_wav
+                                _last_reply_lang = reply_language
+                            if reply_q.full():
+                                try:
+                                    reply_q.get_nowait()
+                                except queue.Empty:
+                                    pass
+                            reply_q.put(new_wav)
+                elif wav:
                     log.info(f"[REPEAT] '{transcript}' — replaying last reply")
                     if reply_q.full():
                         try:
@@ -660,6 +903,7 @@ def processor_thread():
 
             with _hist_lock:
                 _last_reply_wav = wav
+                _last_reply_lang = reply_language
 
             if reply_q.full():
                 try:
@@ -692,9 +936,12 @@ def playback_thread():
         except queue.Empty:
             continue
 
-        t0 = time.time()
-        _play(wav)
-        log.info(f"[PLAY] {time.time()-t0:.2f}s")
+        try:
+            t0 = time.time()
+            _play(wav)
+            log.info(f"[PLAY] {time.time()-t0:.2f}s")
+        except Exception as e:
+            log.error(f"[PLAY] Unhandled error: {e}", exc_info=True)
 
     log.info("Playback stopped.")
 

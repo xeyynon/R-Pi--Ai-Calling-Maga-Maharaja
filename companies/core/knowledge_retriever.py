@@ -48,11 +48,29 @@ KNOWLEDGE_FILES = [
 MAX_CONTEXT_CHARS = 1200  # keep the LLM prompt small and fast
 CORE_FILENAME = "core/always_on.md"
 
+# path -> (mtime, [sections]). Avoids re-reading and re-splitting every
+# knowledge file on every single turn when nothing has changed, while
+# still picking up edits (e.g. the owner updating a price) without
+# needing to restart the process — checked via mtime, not a one-time
+# load.
+_sections_cache: dict[Path, tuple[float, list[str]]] = {}
+
 
 def _split_sections(text: str) -> list[str]:
     """Split a markdown doc into sections on ## headers (falls back to whole doc)."""
     sections = re.split(r"(?=^##\s+)", text, flags=re.MULTILINE)
     return [s.strip() for s in sections if s.strip()]
+
+
+def _get_sections(file_path: Path) -> list[str]:
+    mtime = file_path.stat().st_mtime
+    cached = _sections_cache.get(file_path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    sections = _split_sections(file_path.read_text(encoding="utf-8"))
+    _sections_cache[file_path] = (mtime, sections)
+    return sections
 
 
 def _score_section(section: str, query_words: set[str]) -> int:
@@ -97,8 +115,7 @@ def get_relevant_context(company_dir: Path, transcript: str) -> str:
         if not file_path.exists():
             continue
 
-        text = file_path.read_text(encoding="utf-8")
-        for section in _split_sections(text):
+        for section in _get_sections(file_path):
             score = _score_section(section, query_words)
             if score > 0:
                 scored_sections.append((score, section))

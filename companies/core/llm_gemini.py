@@ -2,9 +2,9 @@
 llm_gemini.py
 
 Thin wrapper around Gemini (via Vertex AI) that exposes a simple
-chat-completion style function, so conversation_manager.py and
-intent_classifier.py don't need to know Gemini's message format
-differs from Groq/OpenAI-style {"role", "content"} dicts.
+chat-completion style function, so conversation_manager.py doesn't
+need to know Gemini's message format differs from Groq/OpenAI-style
+{"role", "content"} dicts.
 
 Requires:
     pip install google-genai
@@ -23,7 +23,16 @@ import os
 from google import genai
 from google.genai import types
 
+from .retry import with_retry
+
 log = logging.getLogger("llm_gemini")
+
+# Without an explicit deadline, a stalled network request can block
+# this call forever without ever raising — with_retry() can't help
+# against that since it only retries on an actual exception. Real
+# calls finish in a few seconds; google-genai's HttpOptions.timeout is
+# in MILLISECONDS (unlike the STT/TTS clients, which take seconds).
+REQUEST_TIMEOUT_MS = 25_000
 
 _client = None
 
@@ -65,14 +74,13 @@ def _split_system_and_turns(messages: list[dict]) -> tuple[str, list[types.Conte
 def ask(model: str, messages: list[dict], max_tokens: int, temperature: float) -> str:
     """
     Same shape of inputs as a Groq chat.completions.create() call would
-    take, so this can be dropped into conversation_manager.py /
-    intent_classifier.py as a near drop-in replacement.
+    take, so this was a near drop-in replacement in conversation_manager.py.
     """
     client = _get_client()
     system_instruction, turns = _split_system_and_turns(messages)
 
     try:
-        response = client.models.generate_content(
+        response = with_retry(lambda: client.models.generate_content(
             model=model,
             contents=turns,
             config=types.GenerateContentConfig(
@@ -88,8 +96,9 @@ def ask(model: str, messages: list[dict], max_tokens: int, temperature: float) -
                 # Disabling it also cuts latency since thinking happens
                 # before the visible answer is generated.
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
+                http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
             ),
-        )
+        ))
         return (response.text or "").strip()
     except Exception as e:
         log.error(f"[GEMINI] {e}")
