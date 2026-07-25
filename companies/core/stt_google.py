@@ -82,7 +82,16 @@ def transcribe(pcm: bytes) -> tuple[str, str]:
         return "", "ERROR"
 
     if not response.results:
-        log.debug("[STT] No speech recognized.")
+        # INFO, not DEBUG: this is the single most common way a turn ends
+        # in silence with the caller waiting. At DEBUG (the default level
+        # is INFO) it left a recorded utterance with NO trace at all
+        # between its [REC] line and the next event, making a silent bot
+        # indistinguishable from a hung thread. Duration is logged so it
+        # can be correlated against the matching [REC] line.
+        log.info(
+            f"[STT] No speech recognized "
+            f"({len(pcm) / (SAMPLE_RATE * 2):.2f}s audio, {elapsed:.2f}s)"
+        )
         return "", ""
 
     result = response.results[0]

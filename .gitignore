@@ -1,0 +1,11 @@
+# Per-deployment settings — each person keeps their own, see
+# local_config.example.py for the template that IS shared.
+local_config.py
+
+# Runtime logs — contain real caller conversation transcripts.
+ai_caller.log
+ai_caller.log.*
+
+# Python
+__pycache__/
+*.pyc

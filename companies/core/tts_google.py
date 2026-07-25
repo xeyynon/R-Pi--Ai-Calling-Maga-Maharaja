@@ -16,7 +16,9 @@ automatically start using them without a code change.
 """
 
 import logging
+import re
 import time
+from xml.sax.saxutils import escape as _xml_escape
 
 from google.cloud import texttospeech
 
@@ -39,6 +41,29 @@ REQUEST_TIMEOUT_SEC = 20
 
 _client = None
 _voice_cache: dict[str, str] = {}  # language_code -> voice name
+
+# Phone numbers and UPI IDs get read as one huge cardinal number
+# ("nine billion...") by Google TTS's default number normalization,
+# which is useless to a caller trying to note one down. 6+ consecutive
+# digits is comfortably above any real product price in this business
+# (max ₹1550, 4 digits) but safely catches 10-digit Indian mobile
+# numbers/UPI IDs — so prices/weights/quantities keep reading as
+# normal numbers, only long digit runs get spelled out one digit at
+# a time.
+_DIGIT_RUN_PATTERN = re.compile(r"\d{6,}")
+
+
+def _to_ssml(text: str) -> str:
+    """Wraps long digit runs in <say-as interpret-as="characters">
+    so they're read digit-by-digit instead of as one giant number."""
+    parts = []
+    last_end = 0
+    for m in _DIGIT_RUN_PATTERN.finditer(text):
+        parts.append(_xml_escape(text[last_end:m.start()]))
+        parts.append(f'<say-as interpret-as="characters">{m.group()}</say-as>')
+        last_end = m.end()
+    parts.append(_xml_escape(text[last_end:]))
+    return f"<speak>{''.join(parts)}</speak>"
 
 
 def _get_client():
@@ -117,7 +142,7 @@ def synthesize(text: str, language_code: str = DEFAULT_LANGUAGE) -> bytes | None
         language_code = DEFAULT_LANGUAGE
         voice_name = _pick_voice_for_language(DEFAULT_LANGUAGE)
 
-    synthesis_input = texttospeech.SynthesisInput(text=text)
+    synthesis_input = texttospeech.SynthesisInput(ssml=_to_ssml(text))
     voice_params = texttospeech.VoiceSelectionParams(
         language_code=language_code,
         name=voice_name if voice_name else None,

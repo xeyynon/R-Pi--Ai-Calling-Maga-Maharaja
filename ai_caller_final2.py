@@ -41,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -58,9 +59,27 @@ from companies.core.conversation_manager import ConversationManager
 # Google Cloud project + region. Must match what you set with:
 #   gcloud config set project YOUR_PROJECT_ID
 #   gcloud auth application-default set-quota-project YOUR_PROJECT_ID
-# Set as env vars, or hardcode here.
-os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "1078973938049")
-os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "asia-south1")
+#
+# Resolved in this priority order, so this file never hardcodes any
+# one person's project:
+#   1. GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION env vars, if set
+#   2. local_config.py (see local_config.example.py) — copy that file
+#      to local_config.py and fill in your own project; local_config.py
+#      is gitignored, so each deployer keeps their own and it's never
+#      shared/committed alongside this code
+#   3. a placeholder that fails loudly on startup, rather than silently
+#      running against someone else's project
+try:
+    from local_config import GOOGLE_CLOUD_PROJECT as _LOCAL_PROJECT
+except ImportError:
+    _LOCAL_PROJECT = "your-project-id-here"
+try:
+    from local_config import GOOGLE_CLOUD_LOCATION as _LOCAL_LOCATION
+except ImportError:
+    _LOCAL_LOCATION = "asia-south1"
+
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", _LOCAL_PROJECT)
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", _LOCAL_LOCATION)
 
 # Which company's knowledge base + rules to use. Switching companies
 # later is just changing this line — see companies/<name>/.
@@ -185,6 +204,7 @@ TELUGU_MARKERS = {
     "undi", "ledu", "chestha", "chestunna", "cheppandi", "kosam",
     "nenu", "nuvvu", "vachindi", "ivvandi", "cheyagalanu", "gurinchi",
     "chepthanu", "pampistamu", "avunu", "sare", "sari",
+    "anta", "antha", "unnai", "vundi", "kuda", "ivvu", "cheppu",
 }
 
 
@@ -267,6 +287,15 @@ _shutdown   = threading.Event()
 _playing    = threading.Event()   # echo guard
 _node_lock  = threading.Lock()
 _hist_lock  = threading.Lock()
+_play_lock  = threading.Lock()
+_play_proc  = None   # in-flight pw-play, so a hangup can stop it
+
+# Bumped at every call boundary. Queued audio and queued replies carry
+# the generation they belong to, so work that began during one call can
+# never be spoken into the next one. Written only by the watchdog thread
+# (inside _drain_queues), read by recorder/processor/playback — a single
+# writer of a plain int needs no lock.
+_call_gen   = 0
 
 _inp_node   = None
 _out_node   = None
@@ -276,6 +305,7 @@ _history    = []
 _conv_mgr   = None   # ConversationManager instance, set in main()
 _vad        = webrtcvad.Vad(VAD_MODE)
 
+_no_speech_apologized = False  # one "didn't catch that" per run of unrecognised turns
 _last_reply_wav  = None   # cached audio of the last spoken reply, for "repeat please"
 _last_reply_lang = None   # language that reply was actually spoken in
 
@@ -356,12 +386,49 @@ def _device_name():
 
 
 def _clear_history(reason=""):
-    global _last_reply_wav, _last_reply_lang
+    global _last_reply_wav, _last_reply_lang, _no_speech_apologized
+    _no_speech_apologized = False
     with _hist_lock:
         _history.clear()
         _last_reply_wav = None
         _last_reply_lang = None
     log.info(f"History cleared{': ' + reason if reason else '.'}")
+
+
+def _drain_queues(reason: str) -> None:
+    """
+    Empties the audio and reply queues at a call boundary.
+
+    _clear_history() resets the transcript history but leaves both
+    queues untouched, so a caller's un-transcribed audio AND their
+    already-synthesised reply both survive the hangup and get consumed
+    by the NEXT caller. Measured across _clear_history("call ended"):
+    audio_q 1 -> 1 and reply_q 1 -> 1, with caller A's reply then
+    playing 2.05s into call B.
+
+    Drained at both boundaries, not just hangup: the processor can
+    finish caller A's turn and enqueue its reply AFTER the hangup
+    drain, so the next call must drain again before it starts.
+
+    Draining alone is still not enough — a turn already in flight in the
+    processor (Gemini 1-3s + TTS 1.4-3.1s) can enqueue its reply after
+    the NEXT call has started and drained. Reproduced: call B began at
+    2.11s, caller A's reply was enqueued at 2.60s and played 3.17s ->
+    4.24s during call B. So the boundary also bumps _call_gen, which
+    every queued item carries; consumers drop anything stale.
+    """
+    global _call_gen
+    _call_gen += 1
+    dropped = 0
+    for q in (audio_q, reply_q):
+        while True:
+            try:
+                q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+    if dropped:
+        log.info(f"[ISOLATION] Dropped {dropped} stale queued item(s): {reason}")
 
 
 def watchdog_thread():
@@ -386,6 +453,7 @@ def watchdog_thread():
             if call_now and not had_call:
                 log.info(f"Call detected — device: {_device_name()}")
                 _clear_history("new call")
+                _drain_queues("new call")
                 _play_greeting()
                 had_call = True
 
@@ -401,7 +469,9 @@ def watchdog_thread():
                 missing_polls += 1
                 if missing_polls >= CALL_END_DEBOUNCE_POLLS:
                     log.info("Call ended.")
+                    _stop_playback("call ended")
                     _clear_history("call ended")
+                    _drain_queues("call ended")
                     had_call = False
                     missing_polls = 0
 
@@ -436,6 +506,53 @@ def _is_speech(chunk: bytes) -> bool:
         return False
 
 
+# ── DIAGNOSTIC CAPTURE — temporary, for the silent-turn investigation.
+# Writes the exact PCM handed to STT as a playable WAV so the same bytes
+# can be listened to, measured, and re-submitted to STT offline. This is
+# what separates "STT model is wrong" from "captured audio is bad"
+# without changing any production config.
+#
+# Off unless AI_CALLER_DUMP_DIR is set: production runs are unaffected,
+# and no extra disk writes or API calls happen by default.
+# REMOVE this block, the [REC] energy/byte fields, and the _dump_utterance
+# call once the root cause is proven.
+_DUMP_DIR = os.environ.get("AI_CALLER_DUMP_DIR")
+_dump_seq = 0  # recorder thread only — no lock needed
+
+# pw-record's stderr is normally discarded, which means SCO packet loss,
+# resampler xruns and node errors leave no trace anywhere — one of the
+# remaining F3 hypotheses (Bluetooth transient corruption) cannot be
+# tested without it. Set AI_CALLER_PW_STDERR=<path> to capture it.
+# A FILE, never a PIPE: nothing in this process reads pw-record's stderr,
+# so a pipe could fill its 64KB buffer and block the recorder outright.
+# REMOVE with the rest of the F3 instrumentation.
+_pw_err = None
+if os.environ.get("AI_CALLER_PW_STDERR"):
+    try:
+        _pw_err = open(os.environ["AI_CALLER_PW_STDERR"], "ab", buffering=0)
+    except OSError as _e:
+        log.warning(f"[DIAG] Could not open pw-record stderr log: {_e}")
+
+
+def _dump_utterance(pcm: bytes) -> None:
+    global _dump_seq
+    if not _DUMP_DIR:
+        return
+    try:
+        _dump_seq += 1
+        path = Path(_DUMP_DIR) / f"utt_{datetime.now().strftime('%H%M%S')}_{_dump_seq:03d}.wav"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm)
+        log.info(f"[DUMP] {path.name}")
+    except Exception as e:
+        # Diagnostics must never break a live call.
+        log.warning(f"[DUMP] Failed: {e}")
+
+
 # ─────────────────────────────────────────────────────
 # HALLUCINATION FILTER
 # (language-agnostic now — no ASCII-ratio rejection, since Telugu/Hindi
@@ -446,18 +563,23 @@ def _is_valid(text: str, duration: float) -> bool:
     if not text or len(text.strip()) < 2:
         return False
 
+    # These three rejections are logged at INFO, not DEBUG: each one
+    # discards a transcript Google did recognize and leaves the caller
+    # with silence. At DEBUG they were invisible at the default INFO
+    # level, so a filtered turn looked identical to an STT failure or a
+    # dead thread in the logs.
     lower = text.lower()
     if any(p in lower for p in HALLUCINATION_PHRASES):
-        log.debug(f"[FILTER] Hallucination: '{text}'")
+        log.info(f"[FILTER] Hallucination: '{text}'")
         return False
 
     words = text.split()
     if len(words) < MIN_WORDS:
-        log.debug(f"[FILTER] Too few words ({len(words)}): '{text}'")
+        log.info(f"[FILTER] Too few words ({len(words)}): '{text}'")
         return False
 
     if duration > 0 and (len(words) / duration) < MIN_WORDS_PER_SEC:
-        log.debug(f"[FILTER] Low word rate: '{text}'")
+        log.info(f"[FILTER] Low word rate ({len(words)}w/{duration:.2f}s): '{text}'")
         return False
 
     return True
@@ -625,15 +747,26 @@ def _play(wav_bytes: bytes):
     if not node:
         log.warning("[PLAY] No output node.")
         return
+    global _play_proc
     _playing.set()
+    proc = None
     try:
-        subprocess.run(
+        # Popen + communicate() instead of subprocess.run(): run() gives
+        # no handle, so an in-flight reply could not be stopped at
+        # hangup and kept streaming into the next call. The Bluetooth
+        # OUTPUT node id is stable across calls (bluez_output.<MAC>.1 in
+        # every call in the logs), so that audio really does reach the
+        # next caller. This is the same call shape run() performs
+        # internally; only the handle is new.
+        proc = subprocess.Popen(
             ["pw-play", "--target", node, "-"],
-            input=wav_bytes,
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=PW_PLAY_TIMEOUT_SEC,
         )
+        with _play_lock:
+            _play_proc = proc
+        proc.communicate(input=wav_bytes, timeout=PW_PLAY_TIMEOUT_SEC)
         time.sleep(ECHO_TAIL_SEC)
     except subprocess.TimeoutExpired:
         # Without a timeout here, a stalled Bluetooth link would block
@@ -643,11 +776,36 @@ def _play(wav_bytes: bytes):
         # call (a hang, not an exception, so earlier try/except
         # guards elsewhere don't help against this specific failure).
         log.error(f"[PLAY] pw-play timed out after {PW_PLAY_TIMEOUT_SEC}s — killed.")
+        # subprocess.run() killed the child itself on timeout; with an
+        # explicit Popen that cleanup is ours to do.
+        proc.kill()
+        proc.communicate()
     finally:
+        with _play_lock:
+            _play_proc = None
         _playing.clear()
 
 
+def _stop_playback(reason: str) -> None:
+    """
+    Kills any in-flight pw-play so a reply cannot keep streaming into
+    the next call. _play()'s finally clears _play_proc and _playing, so
+    this only has to end the process — the owning thread unwinds itself.
+    """
+    with _play_lock:
+        proc = _play_proc
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+        log.info(f"[ISOLATION] Stopped in-flight playback: {reason}")
+
+
 def _play_greeting():
+    # Captured at call-detect time, not when synthesis finishes: if the
+    # caller hangs up during the ~1.4s TTS, the boundary bumps the
+    # generation and this greeting is discarded instead of being spoken
+    # into whatever call comes next.
+    gen = _call_gen
+
     def _go():
         # Wait for the Bluetooth SCO link to stabilize before playing —
         # sending audio the instant the call is detected risks the
@@ -656,7 +814,20 @@ def _play_greeting():
         time.sleep(GREETING_DELAY_SEC)
         wav = _synthesize(GREETING, "en-IN")
         if wav:
-            _play(wav)
+            # Queued rather than played on this thread: calling _play()
+            # here ran concurrently with playback_thread's reply, giving
+            # two pw-play processes on one node (measured 1.00s overlap)
+            # and letting whichever finished first clear the shared
+            # _playing echo guard while the other was still audible
+            # (measured 0.95s of recording with the bot still speaking).
+            # Going through reply_q makes playback_thread the single
+            # owner of both playback and _playing.
+            if reply_q.full():
+                try:
+                    reply_q.get_nowait()
+                except queue.Empty:
+                    pass
+            reply_q.put((gen, wav))
     threading.Thread(target=_go, daemon=True).start()
 
 
@@ -696,87 +867,137 @@ def _read_frame(proc, size: int, timeout_sec: float) -> bytes:
 def recorder_thread():
     global _call_node
     log.info("Recorder started.")
+    consecutive_failures = 0
 
     while not _shutdown.is_set():
-        with _node_lock:
-            node = _inp_node
-        if not node:
-            time.sleep(1)
-            continue
-
-        if node != _call_node:
-            _call_node = node
-            _clear_history(f"new node {node}")
-
-        proc = subprocess.Popen(
-            ["pw-record", "--target", node, "-",
-             "--rate", str(SAMPLE_RATE), "--channels", "1", "--format", "s16"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        log.info(f"Stream open: {node}")
-
-        def _reset():
-            return 0, 0, False, bytearray(), time.time()
-
-        speech_frames, silence_run, triggered, buf, t_start = _reset()
-
         try:
-            while not _shutdown.is_set():
-                with _node_lock:
-                    if _inp_node != node:
-                        log.info("Node changed — reopening stream.")
+            with _node_lock:
+                node = _inp_node
+            if not node:
+                time.sleep(1)
+                continue
+
+            if node != _call_node:
+                _call_node = node
+                _clear_history(f"new node {node}")
+
+            proc = subprocess.Popen(
+                ["pw-record", "--target", node, "-",
+                 "--rate", str(SAMPLE_RATE), "--channels", "1", "--format", "s16"],
+                stdout=subprocess.PIPE,
+                stderr=(_pw_err or subprocess.DEVNULL),
+            )
+            # Everything after Popen must live inside the try whose
+            # finally terminates proc. The "Stream open" log used to sit
+            # between the two, so a raise there (rotating-log write
+            # failure, SD card full) skipped the finally and left
+            # pw-record running and holding the Bluetooth capture node —
+            # one orphan per retry. Measured during F1-D verification:
+            # 11 orphaned children in 3 seconds.
+            try:
+                log.info(f"Stream open: {node}")
+
+                def _reset():
+                    return 0, 0, False, bytearray(), time.time()
+
+                speech_frames, silence_run, triggered, buf, t_start = _reset()
+
+                while not _shutdown.is_set():
+                    with _node_lock:
+                        if _inp_node != node:
+                            log.info("Node changed — reopening stream.")
+                            break
+
+                    chunk = _read_frame(proc, FRAME_BYTES, READ_TIMEOUT_SEC)
+                    if len(chunk) < FRAME_BYTES:
+                        log.warning("Stream ended unexpectedly.")
                         break
 
-                chunk = _read_frame(proc, FRAME_BYTES, READ_TIMEOUT_SEC)
-                if len(chunk) < FRAME_BYTES:
-                    log.warning("Stream ended unexpectedly.")
-                    break
-
-                if _playing.is_set():
-                    speech_frames, silence_run, triggered, buf, t_start = _reset()
-                    continue
-
-                is_speech = (_energy(chunk) >= ENERGY_THRESHOLD and _is_speech(chunk))
-
-                if is_speech:
-                    if not triggered:
-                        t_start = time.time()
-                    triggered      = True
-                    speech_frames += 1
-                    silence_run    = 0
-                    buf           += chunk
-
-                elif triggered:
-                    silence_run += 1
-                    buf         += chunk
-
-                    if silence_run >= SILENCE_FRAMES or (time.time() - t_start) >= MAX_UTTERANCE_SEC:
-                        duration = len(buf) / (SAMPLE_RATE * 2)
-                        if speech_frames >= SPEECH_MIN_FRAMES and duration >= MIN_UTTERANCE_SEC:
-                            log.info(f"[REC] {duration:.2f}s / {speech_frames} speech frames")
-                            if audio_q.full():
-                                try:
-                                    audio_q.get_nowait()
-                                    log.debug("[REC] Dropped stale utterance.")
-                                except queue.Empty:
-                                    pass
-                            audio_q.put((bytes(buf), duration))
-                        else:
-                            log.debug(f"[REC] Discarded: {duration:.2f}s / {speech_frames} frames")
-
+                    if _playing.is_set():
                         speech_frames, silence_run, triggered, buf, t_start = _reset()
+                        continue
 
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            log.info("Stream closed.")
+                    is_speech = (_energy(chunk) >= ENERGY_THRESHOLD and _is_speech(chunk))
 
-        if not _shutdown.is_set():
-            time.sleep(RECONNECT_SEC)
+                    if is_speech:
+                        if not triggered:
+                            t_start = time.time()
+                        triggered      = True
+                        speech_frames += 1
+                        silence_run    = 0
+                        buf           += chunk
+
+                    elif triggered:
+                        silence_run += 1
+                        buf         += chunk
+
+                        if silence_run >= SILENCE_FRAMES or (time.time() - t_start) >= MAX_UTTERANCE_SEC:
+                            duration = len(buf) / (SAMPLE_RATE * 2)
+                            if speech_frames >= SPEECH_MIN_FRAMES and duration >= MIN_UTTERANCE_SEC:
+                                pcm = bytes(buf)
+                                # energy/bytes added for the silent-turn
+                                # investigation — one extra pass per utterance,
+                                # not per frame. Remove with the [DUMP] block.
+                                log.info(
+                                    f"[REC] {duration:.2f}s / {speech_frames} speech frames"
+                                    f" / energy {_energy(pcm):.0f} / {len(pcm)}B"
+                                )
+                                _dump_utterance(pcm)
+                                if audio_q.full():
+                                    try:
+                                        audio_q.get_nowait()
+                                        log.debug("[REC] Dropped stale utterance.")
+                                    except queue.Empty:
+                                        pass
+                                # Tagged with the call it was captured in,
+                                # so a turn the processor is still working
+                                # on when the call ends cannot be answered
+                                # into the next call.
+                                audio_q.put((_call_gen, pcm, duration))
+                            else:
+                                log.debug(f"[REC] Discarded: {duration:.2f}s / {speech_frames} frames")
+
+                            speech_frames, silence_run, triggered, buf, t_start = _reset()
+
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                log.info("Stream closed.")
+
+            if not _shutdown.is_set():
+                time.sleep(RECONNECT_SEC)
+            consecutive_failures = 0
+
+        except Exception as e:
+            # This was the only one of the four threads with no exception
+            # guard. watchdog/processor/playback each already have one,
+            # because an unhandled raise in a daemon thread kills it
+            # silently — here that stopped audio capture for the rest of
+            # the process's life: permanent silence, with the process
+            # still looking healthy and not one log line to show it.
+            # Known raisers in this body are subprocess.Popen (pw-record
+            # missing, fork/fd exhaustion) and proc.stdout.fileno() in
+            # _read_frame (ValueError on an already-closed stream).
+            # Waiting before the retry keeps a persistent failure from
+            # hot-spinning the loop and flooding the log.
+            #
+            # Traceback only on the FIRST failure of a run: a persistent
+            # fault retries every RECONNECT_SEC forever, and one
+            # traceback per retry measured 5.7 log lines/sec, which
+            # buries the transcripts and [REC] lines needed to diagnose
+            # anything else (and churns the Pi's SD card). The first
+            # traceback carries all the diagnostic value; repeats only
+            # need to show it is still failing.
+            consecutive_failures += 1
+            log.error(
+                f"[REC] Unhandled error — restarting capture "
+                f"(consecutive failure {consecutive_failures}): {e}",
+                exc_info=(consecutive_failures == 1),
+            )
+            _shutdown.wait(RECONNECT_SEC)
 
     log.info("Recorder stopped.")
 
@@ -786,12 +1007,14 @@ def recorder_thread():
 # ─────────────────────────────────────────────────────
 
 def processor_thread():
-    global _last_reply_wav, _last_reply_lang
+    global _last_reply_wav, _last_reply_lang, _no_speech_apologized
     log.info("Processor started.")
 
     while not _shutdown.is_set():
         try:
-            pcm, duration = audio_q.get(timeout=1)
+            # gen travels with the utterance and is stamped onto whatever
+            # reply this turn produces, however long Gemini/TTS take.
+            gen, pcm, duration = audio_q.get(timeout=1)
         except queue.Empty:
             continue
 
@@ -807,9 +1030,34 @@ def processor_thread():
                                 reply_q.get_nowait()
                             except queue.Empty:
                                 pass
-                        reply_q.put(wav)
+                        reply_q.put((gen, wav))
+                elif not _no_speech_apologized:
+                    # STT ran fine but found nothing. This used to be
+                    # deliberate dead air (see _transcribe's docstring)
+                    # to avoid apologising at noise — but measured on
+                    # real calls it is 2 of 15 utterances, and the caller
+                    # gets no signal at all that they were not heard.
+                    #
+                    # Guarded by a once-per-run flag rather than spoken
+                    # every time: the trigger can be a continuous noise
+                    # source (F3), and apologising on every occurrence
+                    # loops for as long as the noise lasts. One apology,
+                    # then silence until a turn actually succeeds or the
+                    # call ends — bounded by construction, no retries,
+                    # and no new message to translate.
+                    _no_speech_apologized = True
+                    log.info("[STT] Nothing recognised — informing the caller once")
+                    wav = _synthesize(STT_ERROR_MESSAGE, "en-IN")
+                    if wav:
+                        if reply_q.full():
+                            try:
+                                reply_q.get_nowait()
+                            except queue.Empty:
+                                pass
+                        reply_q.put((gen, wav))
                 continue
 
+            _no_speech_apologized = False
             indic_guess = _detect_indic_language(transcript)
             if indic_guess and indic_guess != language_code.lower():
                 log.info(
@@ -836,7 +1084,7 @@ def processor_thread():
                             reply_q.get_nowait()
                         except queue.Empty:
                             pass
-                    reply_q.put(wav)
+                    reply_q.put((gen, wav))
                 continue
 
             if _is_repeat_request(transcript):
@@ -875,7 +1123,7 @@ def processor_thread():
                                     reply_q.get_nowait()
                                 except queue.Empty:
                                     pass
-                            reply_q.put(new_wav)
+                            reply_q.put((gen, new_wav))
                 elif wav:
                     log.info(f"[REPEAT] '{transcript}' — replaying last reply")
                     if reply_q.full():
@@ -883,7 +1131,7 @@ def processor_thread():
                             reply_q.get_nowait()
                         except queue.Empty:
                             pass
-                    reply_q.put(wav)
+                    reply_q.put((gen, wav))
                 else:
                     log.info(f"[REPEAT] '{transcript}' — nothing to repeat yet")
                 continue
@@ -895,10 +1143,15 @@ def processor_thread():
 
             reply, reply_language = _ask(transcript, language_code)
             if not reply:
+                # Was a bare `continue` with no log of any level: an empty
+                # reply from Gemini/the validator silenced the turn without
+                # leaving a single trace anywhere in the pipeline.
+                log.warning(f"[LLM] Empty reply for '{transcript}' — turn dropped")
                 continue
 
             wav = _synthesize(reply, reply_language)
             if not wav:
+                log.warning(f"[TTS] No audio for reply ({reply_language}) — turn dropped")
                 continue
 
             with _hist_lock:
@@ -911,7 +1164,7 @@ def processor_thread():
                     log.debug("[PROC] Dropped stale reply.")
                 except queue.Empty:
                     pass
-            reply_q.put(wav)
+            reply_q.put((gen, wav))
 
         except Exception as e:
             # A single bad turn must never permanently silence the bot
@@ -932,8 +1185,18 @@ def playback_thread():
 
     while not _shutdown.is_set():
         try:
-            wav = reply_q.get(timeout=1)
+            gen, wav = reply_q.get(timeout=1)
         except queue.Empty:
+            continue
+
+        # The only place audio reaches the caller, so this is where the
+        # generation is enforced: a reply built for an earlier call is
+        # dropped rather than spoken to whoever is on the line now.
+        if gen != _call_gen:
+            log.info(
+                f"[ISOLATION] Discarded reply from an earlier call "
+                f"(gen {gen}, current {_call_gen})."
+            )
             continue
 
         try:
@@ -955,8 +1218,9 @@ def main():
 
     if "your-project-id-here" in os.environ["GOOGLE_CLOUD_PROJECT"]:
         sys.exit(
-            "Set GOOGLE_CLOUD_PROJECT (and GOOGLE_CLOUD_LOCATION) — "
-            "env vars, or edit the CONFIG section above."
+            "No Google Cloud project configured. Copy local_config.example.py "
+            "to local_config.py and fill in your own project ID/location "
+            "(or set GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION env vars)."
         )
 
     log.info("AI Caller — Final (Google Cloud edition)")
@@ -991,6 +1255,14 @@ def main():
     while not _shutdown.is_set():
         time.sleep(0.5)
 
+    # A playback in flight blocks playback_thread inside communicate()
+    # for up to PW_PLAY_TIMEOUT_SEC, so it cannot observe _shutdown,
+    # join(timeout=3) below gives up, and the interpreter exits while
+    # pw-play is still streaming. Verified: the child was reparented to
+    # PPID 1 and kept playing audio to the caller after the service had
+    # stopped, holding the Bluetooth output node. Ending it first lets
+    # communicate() return so the thread exits and the join succeeds.
+    _stop_playback("shutting down")
     for t in threads:
         t.join(timeout=3)
     log.info("Done.")
