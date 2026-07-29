@@ -85,13 +85,6 @@ def stream(model: str, messages: list[dict], max_tokens: int, temperature: float
     Streaming call — yields text chunks as Gemini generates them.
     Each chunk is a non-empty string fragment. Caller assembles the
     full reply by concatenating all yielded chunks.
-
-    Retries once, but only if the failure happens before any chunk has
-    been yielded. Once even one chunk has gone out, the caller (the
-    processor thread) may already be synthesizing/queuing it for
-    playback — restarting the call from scratch at that point would
-    re-speak content the caller already heard, so a failure past that
-    point is logged and simply ends the stream instead of retrying.
     """
     client = _get_client()
     system_instruction, turns = _split_system_and_turns(messages)
@@ -99,25 +92,15 @@ def stream(model: str, messages: list[dict], max_tokens: int, temperature: float
     config = _make_config(max_tokens, temperature)
     config.system_instruction = system_instruction
 
-    attempts = 2
-    for attempt in range(1, attempts + 1):
-        yielded_any = False
-        try:
-            response_stream = client.models.generate_content_stream(
-                model=model,
-                contents=turns,
-                config=config,
-            )
-            for chunk in response_stream:
-                text = chunk.text
-                if text:
-                    yielded_any = True
-                    yield text
-            return
-        except Exception as e:
-            if yielded_any:
-                log.error(f"[GEMINI-STREAM] failed after partial output: {e}")
-                return
-            log.warning(f"[GEMINI-STREAM] attempt {attempt}/{attempts} failed before any output: {e}")
-
-    log.error("[GEMINI-STREAM] all attempts failed with no output")
+    try:
+        response_stream = client.models.generate_content_stream(
+            model=model,
+            contents=turns,
+            config=config,
+        )
+        for chunk in response_stream:
+            text = chunk.text
+            if text:
+                yield text
+    except Exception as e:
+        log.error(f"[GEMINI-STREAM] {e}")

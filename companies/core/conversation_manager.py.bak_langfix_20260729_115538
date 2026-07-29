@@ -26,16 +26,6 @@ log = logging.getLogger("conversation_manager")
 
 _SENTENCE_END = re.compile(r'(?<=[.!?।])\s+')
 
-_LANGUAGE_DISPLAY_NAMES = {
-    "en-in": "English",
-    "hi-in": "Hindi",
-    "te-in": "Telugu",
-}
-
-
-def _language_display_name(language_code: str) -> str:
-    return _LANGUAGE_DISPLAY_NAMES.get((language_code or "").lower(), language_code or "English")
-
 
 class ConversationManager:
     def __init__(self, company_dir, llm_model: str, max_tokens: int, temperature: float):
@@ -68,15 +58,7 @@ class ConversationManager:
             parts.append("This is a continuing conversation, not the start of the call — do not greet again.")
 
         if detected_language:
-            lang_name = _language_display_name(detected_language)
-            parts.append(
-                f"The caller's detected language for this turn is: {lang_name}. "
-                f"The most recent user message below will also start with a short "
-                f"parenthetical reminder of this, e.g. \"(Reply in {lang_name}.)\" — "
-                f"that reminder is guidance for you only, never part of what the "
-                f"caller actually said, and must never be echoed, translated, or "
-                f"referenced in your reply."
-            )
+            parts.append(f"The caller's detected language is: {detected_language}.")
 
         if context:
             parts.append(context)
@@ -93,30 +75,12 @@ class ConversationManager:
 
     def _build_messages(self, transcript: str, recent_history: list[dict], context: str, detected_language: str):
         is_first_turn = not recent_history
-        # get_relevant_context() must see the caller's actual words, not
-        # the language-reminder wrapper added below, so this uses the
-        # raw transcript, before any modification.
         knowledge = get_relevant_context(self.company_dir, transcript)
         system_prompt = self._build_system_prompt(context, knowledge, detected_language, is_first_turn)
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(recent_history)
-
-        # The system prompt's language-detected line sits far from the
-        # actual generation point once a few prior turns exist — Vertex
-        # AI's system_instruction is structurally separate from the
-        # conversation turns, and a several-turns-old Hindi conversation
-        # pattern in recent_history was observed outweighing that single
-        # upfront line, producing Hindi text even when this turn was
-        # correctly tagged Telugu. Repeating the reminder here, inline
-        # with the newest turn, puts it at the position closest to where
-        # Gemini actually generates, which carries far more weight.
-        user_content = transcript
-        if detected_language:
-            lang_name = _language_display_name(detected_language)
-            user_content = f"(Reply in {lang_name}.) {transcript}"
-
-        messages.append({"role": "user", "content": user_content})
+        messages.append({"role": "user", "content": transcript})
         return messages, is_first_turn
 
     def handle_turn(self, transcript: str, recent_history: list[dict], context: str, detected_language: str):

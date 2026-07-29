@@ -116,89 +116,21 @@ GREETING = (
 STT_ERROR_MESSAGE = "Sorry, I didn't catch that. Could you please repeat?"
 
 # VAD / Audio
-#
-# Every VAD/endpointing knob below is env-var configurable (Phase C of
-# the VAD latency workflow) so tuning the hangover — or anything else
-# here — never requires a code edit or redeploy, only a restart with a
-# different env var. Every default below is the exact value this file
-# used to hardcode, so deploying this change alone alters nothing;
-# behavior only changes once an env var is actually set.
-SAMPLE_RATE       = 16000  # not env-configurable: webrtcvad only accepts
-                            # 8000/16000/32000/48000 Hz and changing it
-                            # would require re-deriving Bluetooth capture
-                            # params too — validated at startup below.
-
-VAD_FRAME_MS      = int(os.getenv("VAD_FRAME_MS", "30"))       # 10, 20, or 30 only
-FRAME_MS          = VAD_FRAME_MS  # old name, kept so nothing downstream needs renaming
+SAMPLE_RATE       = 16000
+FRAME_MS          = 30
 FRAME_BYTES       = int(SAMPLE_RATE * FRAME_MS / 1000) * 2
 
-VAD_MODE           = int(os.getenv("VAD_MODE", "3"))            # 0-3, 3 = most aggressive
-VAD_ENERGY_THRESHOLD = float(os.getenv("VAD_ENERGY_THRESHOLD", "300"))  # mean abs amplitude below this = not speech
-ENERGY_THRESHOLD  = VAD_ENERGY_THRESHOLD  # old name, kept so nothing downstream needs renaming
-
-# The onset guard: how many frames of accumulated qualifying speech
-# before an utterance is treated as real rather than a noise blip. Was
-# hardcoded at 20 (600ms) — too high for short imperative commands like
-# "stop"/"chup", which real calls showed getting silently discarded
-# before ever reaching STT (utterance_len 0.5-0.7s, no [REC] line at
-# all, well under the old bar). Lowered to 10 (300ms), enough for a
-# clearly-spoken single word — the ENERGY_THRESHOLD+VAD frame-level
-# gate above is still the primary noise filter; this is a secondary
-# "is it worth transcribing" guard, and STT itself already handles
-# ambiguous short clips by returning no speech recognized.
-VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES", "10"))
-SPEECH_MIN_FRAMES = VAD_MIN_SPEECH_FRAMES  # old name, kept so nothing downstream needs renaming
-
-# A synthetic round-trip test (TTS "stop"/"chup" -> replayed through
-# this exact onset logic) showed even the lowered SPEECH_MIN_FRAMES
-# above can still be too high for a single curt command word — "chup"
-# only produced 4 qualifying frames in that test. Lowering the general
-# bar further to catch that would also let more real background noise
-# through as if it were a normal question, which is a worse trade.
-# Instead: a MUCH shorter capture (down to this many frames) is still
-# queued, but tagged "tentative" — processor_thread only acts on a
-# tentative capture if it actually turns out to be a stop-word, and
-# silently discards it otherwise (no apology, no Gemini call, no
-# history entry), so this doesn't loosen the noise floor for anything
-# except genuinely short imperative commands.
-VAD_STOP_CHECK_MIN_FRAMES = int(os.getenv("VAD_STOP_CHECK_MIN_FRAMES", "4"))
-
-# The primary lever: how long a caller must fall silent before the bot
-# decides they're done talking. Expressed in ms (not frames) so that
-# changing VAD_FRAME_MS above can never silently change how long the
-# hangover actually is in wall-clock time.
-#
-# 500ms chosen via the VAD latency sweep (2026-07-29): 750/600/500ms all
-# produced zero truncation across English/Hindi/Telugu pause-canary and
-# long-utterance test utterances (logs/vad_metrics.csv), while 400ms
-# reproducibly split multiple utterances into separate conversational
-# turns — e.g. "I wanted to ask about... the ghee" repeatedly cut to
-# just "I wanted to ask about" (utterance_len ~2.2s vs ~2.9s once it
-# fully captured the sentence at 500ms), and "Maine kal order kiya tha,
-# lekin... abhi tak nahi aaya" arriving as two unrelated turns. 500ms is
-# the lowest value tested with no observed truncation — see
-# STT_Benchmark and VAD workflow session notes for the full sweep.
-VAD_HANGOVER_MS   = int(os.getenv("VAD_HANGOVER_MS", "500"))    # was hardcoded 750ms (SILENCE_FRAMES=25 * 30ms) before this sweep
-SILENCE_FRAMES    = max(1, VAD_HANGOVER_MS // FRAME_MS)         # derived, frames — consecutive silent frames = utterance ended
-
-# Was 800ms — same real-call evidence as VAD_MIN_SPEECH_FRAMES above:
-# short commands like "stop"/"chup" were landing at 0.5-0.7s total and
-# getting discarded here before reaching STT. Lowered to 400ms.
-VAD_MIN_UTTERANCE_MS = int(os.getenv("VAD_MIN_UTTERANCE_MS", "400"))
-MIN_UTTERANCE_SEC = VAD_MIN_UTTERANCE_MS / 1000  # old name, kept so nothing downstream needs renaming
+VAD_MODE          = 3      # 0-3, 3 = most aggressive
+ENERGY_THRESHOLD  = 300    # mean abs amplitude below this = not speech
+SPEECH_MIN_FRAMES = 20     # sustained speech frames required
+SILENCE_FRAMES    = 25     # consecutive silent frames = utterance ended
+MIN_UTTERANCE_SEC = 0.8
 MAX_UTTERANCE_SEC = 12.0
 MIN_WORDS         = 1      # lowered from 2 — single-word acknowledgments
                             # ("ok", "hmm", "avunu") are real, valid utterances,
                             # just ones that get handled without an LLM call
                             # (see ACK_WORDS / REPEAT_KEYWORDS below)
 MIN_WORDS_PER_SEC = 0.4    # below this = noise hallucination
-
-if VAD_FRAME_MS not in (10, 20, 30):
-    sys.exit(f"VAD_FRAME_MS must be 10, 20, or 30 (webrtcvad requirement) — got {VAD_FRAME_MS}")
-if VAD_MODE not in (0, 1, 2, 3):
-    sys.exit(f"VAD_MODE must be 0-3 — got {VAD_MODE}")
-if SAMPLE_RATE not in (8000, 16000, 32000, 48000):
-    sys.exit(f"SAMPLE_RATE must be 8000/16000/32000/48000 (webrtcvad requirement) — got {SAMPLE_RATE}")
 
 # ─────────────────────────────────────────────────────
 # VAD METRICS INSTRUMENTATION (Phase B — read-only measurement,
@@ -213,7 +145,7 @@ VAD_METRICS_CSV_PATH = Path(__file__).parent / "logs" / "vad_metrics.csv"
 VAD_METRICS_CSV_HEADER = [
     "timestamp", "call_id", "turn_id", "hangover_wait_s", "silent_frames",
     "utterance_len_s", "vad_mode", "frame_ms", "hangover_ms_config",
-    "transcript_len_words", "truncated_suspect", "tentative",
+    "transcript_len_words", "truncated_suspect",
 ]
 
 # Trailing conjunctions/connectors in English, Hindi, and Telugu that
@@ -277,35 +209,21 @@ REPEAT_KEYWORDS = (
 
 # A caller saying one of these (alone, or as part of a short phrase)
 # wants the bot to pause/stop, not answer a new question — e.g. they
-# got frustrated, or need a moment. Since the barge-in checkpoint was
-# added (playback_thread's between-sentence listen window), this can
-# now be recognized mid-reply too, in the gap between sentences — the
-# caller's speech there gets picked up by the recorder exactly like any
-# other turn, and if it's one of these words, it's handled here. What's
-# still not possible is stopping the bot mid-word, mid-sentence — the
-# mic stays muted while a chunk is actually playing, to avoid reopening
-# the Bluetooth echo/loopback bugs fixed earlier.
-# Safe to match anywhere in the transcript, even amid other words
-# ("please stop", "can you stop for a second", "chup ho jao") — low
-# risk of any of these appearing as an ordinary word in an unrelated
-# food-order sentence.
+# got frustrated, or need a moment. This is recognized BETWEEN turns
+# (the next thing the caller says once the mic is listening again),
+# not mid-sentence while the bot is speaking — the mic is deliberately
+# muted during playback to prevent the Bluetooth echo/loopback bugs
+# fixed earlier, so true "cut the bot off mid-word" interruption isn't
+# possible without reopening that problem.
 STOP_WORDS = {
-    "stop", "hold", "pause", "chup",
-    "ruk", "ruko", "rukja",                              # Hindi
+    "stop", "wait", "hold", "pause",
+    "ruk", "ruko", "rukja", "bas",                      # Hindi
     "aagu", "aapu", "niluvu", "aagandi", "apu",          # Telugu
 }
-# Ambiguous words: real stop-requests when said alone, but common
-# ordinary usage otherwise, so they only count when the WHOLE utterance
-# is nothing but stop-words. "bas" usually means "just/only" inside a
-# longer sentence ("bas do packet chahiye" = "just two packets
-# please"). "wait" is a common natural-speech filler that can preface a
-# real follow-up question ("wait, what's the price of..."), not a
-# request to pause.
-AMBIGUOUS_STOP_WORDS = {"bas", "wait"}
 STOP_KEYWORDS = (
     "stop talking", "wait a", "hold on", "one second", "one minute",
     "give me a second", "give me a minute",
-    "ruk ja", "thoda ruko", "ek minute", "ek second", "chup raho",  # Hindi
+    "ruk ja", "thoda ruko", "ek minute", "ek second",           # Hindi
     "konchem aagu", "oka nimisham", "aagandi konchem",          # Telugu
 )
 
@@ -387,18 +305,6 @@ ECHO_TAIL_SEC  = 1.2   # silence after TTS before mic resumes — Bluetooth SCO
                        # returning implies, so the old 0.4s let the tail end
                        # of the bot's own reply leak into the mic and get
                        # transcribed as a new caller utterance
-
-# Barge-in checkpoint window: how long, after each sentence-chunk's
-# mandatory ECHO_TAIL_SEC mute, the recorder stays genuinely live
-# between chunks watching for either the next chunk of this same reply
-# or the caller starting to talk again. Only adds real latency in the
-# true end-of-reply case (nothing else queued) — in the common case the
-# next chunk is usually already sitting in reply_q by the time this
-# window opens, since Gemini/TTS run concurrently with playback of the
-# previous chunk, so it resolves in a few tens of ms, not the full
-# window. Env-configurable for the same reason VAD_HANGOVER_MS is.
-BARGE_IN_LISTEN_SEC = float(os.getenv("BARGE_IN_LISTEN_SEC", "0.5"))
-BARGE_IN_POLL_SEC   = 0.05  # how often the checkpoint re-checks queue/Event
 PW_PLAY_TIMEOUT_SEC  = 45  # bounds pw-play so a stalled Bluetooth link can't
                            # hang playback forever (longest observed real
                            # reply playback was ~29s, so this leaves margin)
@@ -432,35 +338,6 @@ log = logging.getLogger("ai_caller")
 # ─────────────────────────────────────────────────────
 _shutdown   = threading.Event()
 _playing    = threading.Event()   # echo guard
-# Recorder stays deaf from call-detect until the greeting has actually
-# been spoken. Without this the mic is live during GREETING_DELAY_SEC +
-# greeting synthesis (~5s measured), so Bluetooth SCO start-up noise or
-# the caller's "hello" gets captured, returns nothing from STT, and the
-# bot apologises for not catching something the caller never asked —
-# heard as a second, spurious reply right after the greeting.
-_greeting_guard = threading.Event()
-
-# Barge-in (checkpoint interruption): a streamed reply plays one
-# sentence-chunk at a time, and playback_thread briefly unmutes the
-# recorder in the gap between chunks — never mid-sentence — to check
-# whether the caller has started talking again. Genuine speech during
-# that gap sets this Event; playback_thread reads it, abandons the rest
-# of the current reply, and lets the recorder keep listening instead of
-# re-muting. Set only by recorder_thread, cleared and read only by
-# playback_thread — single writer/single reader, no lock needed (same
-# reasoning already used for _call_gen elsewhere in this file).
-_caller_speaking = threading.Event()
-
-# The reply_id of a reply that was abandoned mid-stream via barge-in.
-# Written only by playback_thread (when it detects the interruption),
-# read only by processor_thread (to stop generating/synthesizing more
-# sentences for a reply nobody is going to hear). Deliberately never
-# reset back to None — reply_id is a monotonically increasing counter,
-# so a stale value can never accidentally match a future reply; trying
-# to clear it at "the right moment" would risk a late-arriving stale
-# chunk from the SAME abandoned reply slipping past the check instead.
-_abandoned_reply_id = None
-
 _node_lock  = threading.Lock()
 _hist_lock  = threading.Lock()
 _play_lock  = threading.Lock()
@@ -495,22 +372,6 @@ audio_q     = queue.Queue(maxsize=3)
 # above what a single ~150-token reply can produce (rarely more than
 # 5-6 sentences) so eviction stays reserved for actually-stale replies.
 reply_q     = queue.Queue(maxsize=10)
-
-# Every item on reply_q carries the id of the reply it belongs to. A
-# streamed answer is enqueued one clip PER SENTENCE and all its clips
-# share one id, so playback can tell "the rest of this same answer"
-# (play back-to-back, no gap) apart from "a different reply that
-# happens to be queued next" (must stay separate — otherwise the
-# greeting and a following apology are heard as one run-on utterance).
-_reply_id_counter = 0
-_reply_id_lock    = threading.Lock()
-
-
-def _next_reply_id() -> int:
-    global _reply_id_counter
-    with _reply_id_lock:
-        _reply_id_counter += 1
-        return _reply_id_counter
 
 # ─────────────────────────────────────────────────────
 # BLUETOOTH — dynamic, no hardcoded MAC
@@ -627,10 +488,6 @@ def _drain_queues(reason: str) -> None:
                 dropped += 1
             except queue.Empty:
                 break
-    # If the call ended before the greeting ever played, its guard would
-    # otherwise stay set and leave the recorder deaf for the next call.
-    # The next call's _play_greeting() re-arms it.
-    _greeting_guard.clear()
     if dropped:
         log.info(f"[ISOLATION] Dropped {dropped} stale queued item(s): {reason}")
 
@@ -851,17 +708,7 @@ def _is_repeat_request(transcript: str) -> bool:
 def _is_stop_request(transcript: str) -> bool:
     """True if the caller wants the bot to pause/stop, not answer a new question."""
     words = re.findall(r"\w+", transcript.lower())
-    if not words:
-        return False
-    # An unambiguous stop-word anywhere in the utterance, even amid
-    # other words — was previously only recognized when it was the
-    # ENTIRE utterance, which missed "please stop" style phrasing.
-    if any(w in STOP_WORDS for w in words):
-        return True
-    # An ambiguous word like "bas" only counts stand-alone (or paired
-    # with other stop-words) — inside a longer sentence it's usually
-    # not a stop request at all (see AMBIGUOUS_STOP_WORDS above).
-    if all(w in (STOP_WORDS | AMBIGUOUS_STOP_WORDS) for w in words):
+    if words and all(w in STOP_WORDS for w in words):
         return True
     lower = transcript.lower()
     return any(k in lower for k in STOP_KEYWORDS)
@@ -1004,24 +851,14 @@ def _concat_wav_chunks(chunks: list[bytes]) -> bytes | None:
     return out.getvalue()
 
 
-def _play(wav_bytes: bytes, set_playing: bool = True, echo_tail: bool = True):
-    """
-    Plays one WAV clip to the Bluetooth output node.
-
-    set_playing/echo_tail exist because a streamed reply arrives as one
-    clip PER SENTENCE: the caller must hear those as a single continuous
-    answer, so playback_thread holds _playing across the whole reply and
-    applies the echo tail once at the end, rather than once per sentence.
-    Defaults keep the original single-clip behaviour for any other caller.
-    """
+def _play(wav_bytes: bytes):
     with _node_lock:
         node = _out_node
     if not node:
         log.warning("[PLAY] No output node.")
         return
     global _play_proc
-    if set_playing:
-        _playing.set()
+    _playing.set()
     proc = None
     try:
         # Popen + communicate() instead of subprocess.run(): run() gives
@@ -1040,8 +877,7 @@ def _play(wav_bytes: bytes, set_playing: bool = True, echo_tail: bool = True):
         with _play_lock:
             _play_proc = proc
         proc.communicate(input=wav_bytes, timeout=PW_PLAY_TIMEOUT_SEC)
-        if echo_tail:
-            time.sleep(ECHO_TAIL_SEC)
+        time.sleep(ECHO_TAIL_SEC)
     except subprocess.TimeoutExpired:
         # Without a timeout here, a stalled Bluetooth link would block
         # this call forever — and since nothing else in the pipeline
@@ -1057,8 +893,7 @@ def _play(wav_bytes: bytes, set_playing: bool = True, echo_tail: bool = True):
     finally:
         with _play_lock:
             _play_proc = None
-        if set_playing:
-            _playing.clear()
+        _playing.clear()
 
 
 def _stop_playback(reason: str) -> None:
@@ -1081,27 +916,13 @@ def _play_greeting():
     # into whatever call comes next.
     gen = _call_gen
 
-    # Hold the recorder deaf until the greeting has actually been
-    # spoken (playback_thread clears this once it finishes a playback
-    # session). Cleared here too on any path that never reaches
-    # playback, so a TTS failure can't leave the mic muted for the
-    # rest of the call.
-    _greeting_guard.set()
-
     def _go():
         # Wait for the Bluetooth SCO link to stabilize before playing —
         # sending audio the instant the call is detected risks the
         # start of the greeting getting clipped while the link is
         # still coming up.
-        try:
-            time.sleep(GREETING_DELAY_SEC)
-            wav = _synthesize(GREETING, "en-IN")
-        except Exception:
-            _greeting_guard.clear()
-            raise
-        if not wav:
-            log.warning("[GREETING] No audio — releasing recorder guard.")
-            _greeting_guard.clear()
+        time.sleep(GREETING_DELAY_SEC)
+        wav = _synthesize(GREETING, "en-IN")
         if wav:
             # Queued rather than played on this thread: calling _play()
             # here ran concurrently with playback_thread's reply, giving
@@ -1116,7 +937,7 @@ def _play_greeting():
                     reply_q.get_nowait()
                 except queue.Empty:
                     pass
-            reply_q.put((gen, wav, _next_reply_id()))
+            reply_q.put((gen, wav))
     threading.Thread(target=_go, daemon=True).start()
 
 
@@ -1202,7 +1023,7 @@ def recorder_thread():
                         log.warning("Stream ended unexpectedly.")
                         break
 
-                    if _playing.is_set() or _greeting_guard.is_set():
+                    if _playing.is_set():
                         speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
                         continue
 
@@ -1221,13 +1042,6 @@ def recorder_thread():
                         # (which the existing MAX_UTTERANCE_SEC check
                         # already relies on and must not be disturbed).
                         t_last_voiced  = time.monotonic()
-                        # Barge-in signal for playback_thread's checkpoint
-                        # window. Safe to set unconditionally here: the
-                        # guard above already makes this branch
-                        # unreachable while _playing is set, so this can
-                        # only ever fire when the mic is genuinely live
-                        # (a checkpoint gap, or normal idle listening).
-                        _caller_speaking.set()
 
                     elif triggered:
                         silence_run += 1
@@ -1251,51 +1065,44 @@ def recorder_thread():
                                 hangover_str, silence_run, duration, VAD_MODE, FRAME_MS,
                             )
 
-                            tentative = False
                             if speech_frames >= SPEECH_MIN_FRAMES and duration >= MIN_UTTERANCE_SEC:
-                                pass  # normal capture
-                            elif speech_frames >= VAD_STOP_CHECK_MIN_FRAMES:
-                                tentative = True
+                                pcm = bytes(buf)
+                                # energy/bytes added for the silent-turn
+                                # investigation — one extra pass per utterance,
+                                # not per frame. Remove with the [DUMP] block.
+                                log.info(
+                                    f"[REC] {duration:.2f}s / {speech_frames} speech frames"
+                                    f" / energy {_energy(pcm):.0f} / {len(pcm)}B"
+                                )
+                                _dump_utterance(pcm)
+                                if audio_q.full():
+                                    try:
+                                        audio_q.get_nowait()
+                                        log.debug("[REC] Dropped stale utterance.")
+                                    except queue.Empty:
+                                        pass
+
+                                global _vad_turn_counter
+                                _vad_turn_counter += 1
+                                vad_metrics = {
+                                    "timestamp": datetime.now().isoformat(),
+                                    "call_id": _call_gen,
+                                    "turn_id": _vad_turn_counter,
+                                    "hangover_wait_s": round(hangover_wait, 3) if hangover_wait is not None else "",
+                                    "silent_frames": silence_run,
+                                    "utterance_len_s": round(duration, 3),
+                                    "vad_mode": VAD_MODE,
+                                    "frame_ms": FRAME_MS,
+                                    "hangover_ms_config": SILENCE_FRAMES * FRAME_MS,
+                                }
+
+                                # Tagged with the call it was captured in,
+                                # so a turn the processor is still working
+                                # on when the call ends cannot be answered
+                                # into the next call.
+                                audio_q.put((_call_gen, pcm, duration, vad_metrics))
                             else:
                                 log.debug(f"[REC] Discarded: {duration:.2f}s / {speech_frames} frames")
-                                speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
-                                continue
-
-                            pcm = bytes(buf)
-                            # energy/bytes added for the silent-turn
-                            # investigation — one extra pass per utterance,
-                            # not per frame. Remove with the [DUMP] block.
-                            log.info(
-                                f"[REC]{' tentative' if tentative else ''} {duration:.2f}s / "
-                                f"{speech_frames} speech frames / energy {_energy(pcm):.0f} / {len(pcm)}B"
-                            )
-                            _dump_utterance(pcm)
-                            if audio_q.full():
-                                try:
-                                    audio_q.get_nowait()
-                                    log.debug("[REC] Dropped stale utterance.")
-                                except queue.Empty:
-                                    pass
-
-                            global _vad_turn_counter
-                            _vad_turn_counter += 1
-                            vad_metrics = {
-                                "timestamp": datetime.now().isoformat(),
-                                "call_id": _call_gen,
-                                "turn_id": _vad_turn_counter,
-                                "hangover_wait_s": round(hangover_wait, 3) if hangover_wait is not None else "",
-                                "silent_frames": silence_run,
-                                "utterance_len_s": round(duration, 3),
-                                "vad_mode": VAD_MODE,
-                                "frame_ms": FRAME_MS,
-                                "hangover_ms_config": VAD_HANGOVER_MS,
-                            }
-
-                            # Tagged with the call it was captured in,
-                            # so a turn the processor is still working
-                            # on when the call ends cannot be answered
-                            # into the next call.
-                            audio_q.put((_call_gen, pcm, duration, vad_metrics, tentative))
 
                             speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
 
@@ -1354,7 +1161,7 @@ def processor_thread():
         try:
             # gen travels with the utterance and is stamped onto whatever
             # reply this turn produces, however long Gemini/TTS take.
-            gen, pcm, duration, vad_metrics, tentative = audio_q.get(timeout=1)
+            gen, pcm, duration, vad_metrics = audio_q.get(timeout=1)
         except queue.Empty:
             continue
 
@@ -1370,22 +1177,7 @@ def processor_thread():
             vad_row = dict(vad_metrics)
             vad_row["transcript_len_words"] = len(transcript.split()) if transcript else 0
             vad_row["truncated_suspect"] = 1 if _is_truncated_suspect(transcript) else 0
-            vad_row["tentative"] = 1 if tentative else 0
             _write_vad_metrics_row(vad_row)
-
-            if tentative and not (transcript and _is_stop_request(transcript)):
-                # Too short to have cleared the normal onset guard —
-                # only worth anything if it turned out to be a curt
-                # command word ("stop"/"chup"/"rukja"). Anything else
-                # here (empty, or real words that aren't a stop
-                # request) is discarded completely silently: no
-                # apology, no Gemini call, no history entry. This is
-                # what lets SPEECH_MIN_FRAMES stay high enough to
-                # reject ordinary background noise while still
-                # catching genuinely short stop-commands the normal
-                # guard would otherwise swallow.
-                log.debug(f"[REC] Tentative short capture discarded: '{transcript}'")
-                continue
 
             if not transcript:
                 if language_code == "ERROR":
@@ -1397,7 +1189,7 @@ def processor_thread():
                                 reply_q.get_nowait()
                             except queue.Empty:
                                 pass
-                        reply_q.put((gen, wav, _next_reply_id()))
+                        reply_q.put((gen, wav))
                 elif not _no_speech_apologized:
                     # STT ran fine but found nothing. This used to be
                     # deliberate dead air (see _transcribe's docstring)
@@ -1421,7 +1213,7 @@ def processor_thread():
                                 reply_q.get_nowait()
                             except queue.Empty:
                                 pass
-                        reply_q.put((gen, wav, _next_reply_id()))
+                        reply_q.put((gen, wav))
                 continue
 
             _no_speech_apologized = False
@@ -1451,7 +1243,7 @@ def processor_thread():
                             reply_q.get_nowait()
                         except queue.Empty:
                             pass
-                    reply_q.put((gen, wav, _next_reply_id()))
+                    reply_q.put((gen, wav))
                 continue
 
             if _is_repeat_request(transcript):
@@ -1490,7 +1282,7 @@ def processor_thread():
                                     reply_q.get_nowait()
                                 except queue.Empty:
                                     pass
-                            reply_q.put((gen, new_wav, _next_reply_id()))
+                            reply_q.put((gen, new_wav))
                 elif wav:
                     log.info(f"[REPEAT] '{transcript}' — replaying last reply")
                     if reply_q.full():
@@ -1498,7 +1290,7 @@ def processor_thread():
                             reply_q.get_nowait()
                         except queue.Empty:
                             pass
-                    reply_q.put((gen, wav, _next_reply_id()))
+                    reply_q.put((gen, wav))
                 else:
                     log.info(f"[REPEAT] '{transcript}' — nothing to repeat yet")
                 continue
@@ -1514,20 +1306,8 @@ def processor_thread():
             full_reply_parts = []
             wav_chunks = []
             reply_language = language_code or "en-IN"
-            # One id for the whole streamed answer — every sentence clip
-            # below carries it so playback plays them as one continuous
-            # reply instead of separate ones.
-            reply_id = _next_reply_id()
 
             for sentence, sent_lang in _ask_streaming(transcript, language_code):
-                if reply_id == _abandoned_reply_id:
-                    # Caller barged in on this reply between sentences —
-                    # playback_thread already stopped playing it and left
-                    # the recorder live. No point paying for more Gemini/
-                    # TTS work on sentences nobody is going to hear.
-                    log.info(f"[BARGE-IN] Stopped generating reply {reply_id} — caller interrupted.")
-                    break
-
                 reply_language = sent_lang
 
                 # Validate BEFORE synthesis/playback, not after. The
@@ -1565,7 +1345,7 @@ def processor_thread():
                                 reply_q.get_nowait()
                             except queue.Empty:
                                 pass
-                        reply_q.put((gen, wav_chunk, reply_id))
+                        reply_q.put((gen, wav_chunk))
                     break
 
                 full_reply_parts.append(validated)
@@ -1580,7 +1360,7 @@ def processor_thread():
                             log.debug("[PROC] Dropped stale reply chunk.")
                         except queue.Empty:
                             pass
-                    reply_q.put((gen, wav_chunk, reply_id))
+                    reply_q.put((gen, wav_chunk))
 
             full_reply = " ".join(full_reply_parts).strip()
             if not full_reply:
@@ -1615,21 +1395,11 @@ def processor_thread():
 def playback_thread():
     log.info("Playback started.")
 
-    # Holds an item belonging to the NEXT reply, pulled off the queue
-    # while draining the current one. It gets its own playback session
-    # on the following pass instead of being glued onto this reply.
-    pending = None
-
     while not _shutdown.is_set():
-        if pending is not None:
-            item, pending = pending, None
-        else:
-            try:
-                item = reply_q.get(timeout=1)
-            except queue.Empty:
-                continue
-
-        gen, wav, reply_id = item
+        try:
+            gen, wav = reply_q.get(timeout=1)
+        except queue.Empty:
+            continue
 
         # The only place audio reaches the caller, so this is where the
         # generation is enforced: a reply built for an earlier call is
@@ -1641,95 +1411,12 @@ def playback_thread():
             )
             continue
 
-        global _abandoned_reply_id
-        if reply_id == _abandoned_reply_id:
-            # A leftover chunk that processor_thread had already queued
-            # for a reply we abandoned via barge-in before it noticed
-            # and stopped generating more of it.
-            continue
-
-        # A streamed answer arrives as one item PER SENTENCE, all sharing
-        # reply_id, and must be heard as one continuous reply — so
-        # _playing is held while a chunk is actually playing and its
-        # clips play back-to-back. Anything with a DIFFERENT reply_id is
-        # a separate reply (e.g. the greeting followed by "I didn't
-        # catch that") and is deliberately not merged, or the caller
-        # hears the two as a single run-on utterance.
-        _playing.set()
-        chunks = 0
-        barged_in = False
         try:
             t0 = time.time()
-            while True:
-                _play(wav, set_playing=False, echo_tail=False)
-                chunks += 1
-
-                # Mandatory echo decay — mic stays muted. Unconditional,
-                # regardless of what (if anything) comes next.
-                time.sleep(ECHO_TAIL_SEC)
-
-                # Checkpoint: genuinely unmute between chunks and watch
-                # for either the next chunk of THIS reply arriving, or
-                # the caller actually starting to talk. Never happens
-                # mid-sentence — only in this gap.
-                _caller_speaking.clear()
-                _playing.clear()
-                next_item = None
-                deadline = time.monotonic() + BARGE_IN_LISTEN_SEC
-                while time.monotonic() < deadline:
-                    if _caller_speaking.is_set():
-                        barged_in = True
-                        break
-                    try:
-                        next_item = reply_q.get(timeout=BARGE_IN_POLL_SEC)
-                        break
-                    except queue.Empty:
-                        continue
-
-                if barged_in:
-                    _abandoned_reply_id = reply_id
-                    log.info(
-                        f"[BARGE-IN] Caller interrupted reply {reply_id} "
-                        f"after {chunks} chunk(s) — recorder stays live."
-                    )
-                    break  # leave _playing CLEARED so the recorder keeps capturing
-
-                if next_item is None:
-                    # Nothing arrived in the whole checkpoint window:
-                    # this reply is over. Leave _playing CLEARED — the
-                    # ECHO_TAIL_SEC mute already happened above, so this
-                    # is a clean, fully-muted-then-live end state, same
-                    # as before.
-                    break
-
-                n_gen, n_wav, n_reply_id = next_item
-                if n_gen != _call_gen:
-                    log.info(
-                        f"[ISOLATION] Discarded reply from an earlier call "
-                        f"(gen {n_gen}, current {_call_gen})."
-                    )
-                    break
-
-                if n_reply_id != reply_id:
-                    pending = next_item
-                    break
-
-                # Same reply's next sentence — re-mute before playing it.
-                _playing.set()
-                wav = n_wav
-
-            log.info(
-                f"[PLAY] {time.time()-t0:.2f}s ({chunks} chunk{'' if chunks == 1 else 's'})"
-                + (" [interrupted]" if barged_in else "")
-            )
+            _play(wav)
+            log.info(f"[PLAY] {time.time()-t0:.2f}s")
         except Exception as e:
             log.error(f"[PLAY] Unhandled error: {e}", exc_info=True)
-        finally:
-            _playing.clear()
-            # The greeting is always the first thing played on a call,
-            # so once any playback session has completed the startup
-            # window is over and the recorder can listen again.
-            _greeting_guard.clear()
 
     log.info("Playback stopped.")
 
@@ -1749,17 +1436,6 @@ def main():
         )
 
     _init_vad_metrics_csv()
-
-    # Every log file is self-describing from here on — no need to cross
-    # -reference which env vars were set for a given run's [VAD] lines.
-    log.info(
-        "[VAD-CONFIG] mode=%d frame_ms=%d hangover_ms=%d (=%d frames) "
-        "min_utterance_ms=%d min_speech_frames=%d stop_check_min_frames=%d "
-        "energy_threshold=%.0f sample_rate=%d",
-        VAD_MODE, VAD_FRAME_MS, VAD_HANGOVER_MS, SILENCE_FRAMES,
-        VAD_MIN_UTTERANCE_MS, VAD_MIN_SPEECH_FRAMES, VAD_STOP_CHECK_MIN_FRAMES,
-        VAD_ENERGY_THRESHOLD, SAMPLE_RATE,
-    )
 
     log.info("AI Caller — Final (Google Cloud edition)")
     log.info(f"LLM={LLM_MODEL} | Project={os.environ['GOOGLE_CLOUD_PROJECT']} | "

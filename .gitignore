@@ -9,3 +9,7 @@ ai_caller.log.*
 # Python
 __pycache__/
 *.pyc
+
+# VAD instrumentation metrics (Phase B, VAD latency workflow) — numeric
+# only (timestamps, durations, word counts), no verbatim transcript text
+logs/

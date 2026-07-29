@@ -135,33 +135,7 @@ FRAME_BYTES       = int(SAMPLE_RATE * FRAME_MS / 1000) * 2
 VAD_MODE           = int(os.getenv("VAD_MODE", "3"))            # 0-3, 3 = most aggressive
 VAD_ENERGY_THRESHOLD = float(os.getenv("VAD_ENERGY_THRESHOLD", "300"))  # mean abs amplitude below this = not speech
 ENERGY_THRESHOLD  = VAD_ENERGY_THRESHOLD  # old name, kept so nothing downstream needs renaming
-
-# The onset guard: how many frames of accumulated qualifying speech
-# before an utterance is treated as real rather than a noise blip. Was
-# hardcoded at 20 (600ms) — too high for short imperative commands like
-# "stop"/"chup", which real calls showed getting silently discarded
-# before ever reaching STT (utterance_len 0.5-0.7s, no [REC] line at
-# all, well under the old bar). Lowered to 10 (300ms), enough for a
-# clearly-spoken single word — the ENERGY_THRESHOLD+VAD frame-level
-# gate above is still the primary noise filter; this is a secondary
-# "is it worth transcribing" guard, and STT itself already handles
-# ambiguous short clips by returning no speech recognized.
-VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES", "10"))
-SPEECH_MIN_FRAMES = VAD_MIN_SPEECH_FRAMES  # old name, kept so nothing downstream needs renaming
-
-# A synthetic round-trip test (TTS "stop"/"chup" -> replayed through
-# this exact onset logic) showed even the lowered SPEECH_MIN_FRAMES
-# above can still be too high for a single curt command word — "chup"
-# only produced 4 qualifying frames in that test. Lowering the general
-# bar further to catch that would also let more real background noise
-# through as if it were a normal question, which is a worse trade.
-# Instead: a MUCH shorter capture (down to this many frames) is still
-# queued, but tagged "tentative" — processor_thread only acts on a
-# tentative capture if it actually turns out to be a stop-word, and
-# silently discards it otherwise (no apology, no Gemini call, no
-# history entry), so this doesn't loosen the noise floor for anything
-# except genuinely short imperative commands.
-VAD_STOP_CHECK_MIN_FRAMES = int(os.getenv("VAD_STOP_CHECK_MIN_FRAMES", "4"))
+SPEECH_MIN_FRAMES = 20     # sustained speech frames required (onset guard, not the hangover — out of scope for this task)
 
 # The primary lever: how long a caller must fall silent before the bot
 # decides they're done talking. Expressed in ms (not frames) so that
@@ -181,10 +155,7 @@ VAD_STOP_CHECK_MIN_FRAMES = int(os.getenv("VAD_STOP_CHECK_MIN_FRAMES", "4"))
 VAD_HANGOVER_MS   = int(os.getenv("VAD_HANGOVER_MS", "500"))    # was hardcoded 750ms (SILENCE_FRAMES=25 * 30ms) before this sweep
 SILENCE_FRAMES    = max(1, VAD_HANGOVER_MS // FRAME_MS)         # derived, frames — consecutive silent frames = utterance ended
 
-# Was 800ms — same real-call evidence as VAD_MIN_SPEECH_FRAMES above:
-# short commands like "stop"/"chup" were landing at 0.5-0.7s total and
-# getting discarded here before reaching STT. Lowered to 400ms.
-VAD_MIN_UTTERANCE_MS = int(os.getenv("VAD_MIN_UTTERANCE_MS", "400"))
+VAD_MIN_UTTERANCE_MS = int(os.getenv("VAD_MIN_UTTERANCE_MS", "800"))
 MIN_UTTERANCE_SEC = VAD_MIN_UTTERANCE_MS / 1000  # old name, kept so nothing downstream needs renaming
 MAX_UTTERANCE_SEC = 12.0
 MIN_WORDS         = 1      # lowered from 2 — single-word acknowledgments
@@ -213,7 +184,7 @@ VAD_METRICS_CSV_PATH = Path(__file__).parent / "logs" / "vad_metrics.csv"
 VAD_METRICS_CSV_HEADER = [
     "timestamp", "call_id", "turn_id", "hangover_wait_s", "silent_frames",
     "utterance_len_s", "vad_mode", "frame_ms", "hangover_ms_config",
-    "transcript_len_words", "truncated_suspect", "tentative",
+    "transcript_len_words", "truncated_suspect",
 ]
 
 # Trailing conjunctions/connectors in English, Hindi, and Telugu that
@@ -290,18 +261,16 @@ REPEAT_KEYWORDS = (
 # risk of any of these appearing as an ordinary word in an unrelated
 # food-order sentence.
 STOP_WORDS = {
-    "stop", "hold", "pause", "chup",
+    "stop", "wait", "hold", "pause", "chup",
     "ruk", "ruko", "rukja",                              # Hindi
     "aagu", "aapu", "niluvu", "aagandi", "apu",          # Telugu
 }
-# Ambiguous words: real stop-requests when said alone, but common
-# ordinary usage otherwise, so they only count when the WHOLE utterance
-# is nothing but stop-words. "bas" usually means "just/only" inside a
-# longer sentence ("bas do packet chahiye" = "just two packets
-# please"). "wait" is a common natural-speech filler that can preface a
-# real follow-up question ("wait, what's the price of..."), not a
-# request to pause.
-AMBIGUOUS_STOP_WORDS = {"bas", "wait"}
+# "bas" alone commonly means "stop/enough", but as one word inside a
+# longer sentence it usually means "just/only" ("bas do packet
+# chahiye" = "just two packets please") — matching it anywhere would
+# misfire on ordinary orders, so it only counts when the WHOLE
+# utterance is nothing but this (plus other stop-words).
+AMBIGUOUS_STOP_WORDS = {"bas"}
 STOP_KEYWORDS = (
     "stop talking", "wait a", "hold on", "one second", "one minute",
     "give me a second", "give me a minute",
@@ -1251,51 +1220,44 @@ def recorder_thread():
                                 hangover_str, silence_run, duration, VAD_MODE, FRAME_MS,
                             )
 
-                            tentative = False
                             if speech_frames >= SPEECH_MIN_FRAMES and duration >= MIN_UTTERANCE_SEC:
-                                pass  # normal capture
-                            elif speech_frames >= VAD_STOP_CHECK_MIN_FRAMES:
-                                tentative = True
+                                pcm = bytes(buf)
+                                # energy/bytes added for the silent-turn
+                                # investigation — one extra pass per utterance,
+                                # not per frame. Remove with the [DUMP] block.
+                                log.info(
+                                    f"[REC] {duration:.2f}s / {speech_frames} speech frames"
+                                    f" / energy {_energy(pcm):.0f} / {len(pcm)}B"
+                                )
+                                _dump_utterance(pcm)
+                                if audio_q.full():
+                                    try:
+                                        audio_q.get_nowait()
+                                        log.debug("[REC] Dropped stale utterance.")
+                                    except queue.Empty:
+                                        pass
+
+                                global _vad_turn_counter
+                                _vad_turn_counter += 1
+                                vad_metrics = {
+                                    "timestamp": datetime.now().isoformat(),
+                                    "call_id": _call_gen,
+                                    "turn_id": _vad_turn_counter,
+                                    "hangover_wait_s": round(hangover_wait, 3) if hangover_wait is not None else "",
+                                    "silent_frames": silence_run,
+                                    "utterance_len_s": round(duration, 3),
+                                    "vad_mode": VAD_MODE,
+                                    "frame_ms": FRAME_MS,
+                                    "hangover_ms_config": VAD_HANGOVER_MS,
+                                }
+
+                                # Tagged with the call it was captured in,
+                                # so a turn the processor is still working
+                                # on when the call ends cannot be answered
+                                # into the next call.
+                                audio_q.put((_call_gen, pcm, duration, vad_metrics))
                             else:
                                 log.debug(f"[REC] Discarded: {duration:.2f}s / {speech_frames} frames")
-                                speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
-                                continue
-
-                            pcm = bytes(buf)
-                            # energy/bytes added for the silent-turn
-                            # investigation — one extra pass per utterance,
-                            # not per frame. Remove with the [DUMP] block.
-                            log.info(
-                                f"[REC]{' tentative' if tentative else ''} {duration:.2f}s / "
-                                f"{speech_frames} speech frames / energy {_energy(pcm):.0f} / {len(pcm)}B"
-                            )
-                            _dump_utterance(pcm)
-                            if audio_q.full():
-                                try:
-                                    audio_q.get_nowait()
-                                    log.debug("[REC] Dropped stale utterance.")
-                                except queue.Empty:
-                                    pass
-
-                            global _vad_turn_counter
-                            _vad_turn_counter += 1
-                            vad_metrics = {
-                                "timestamp": datetime.now().isoformat(),
-                                "call_id": _call_gen,
-                                "turn_id": _vad_turn_counter,
-                                "hangover_wait_s": round(hangover_wait, 3) if hangover_wait is not None else "",
-                                "silent_frames": silence_run,
-                                "utterance_len_s": round(duration, 3),
-                                "vad_mode": VAD_MODE,
-                                "frame_ms": FRAME_MS,
-                                "hangover_ms_config": VAD_HANGOVER_MS,
-                            }
-
-                            # Tagged with the call it was captured in,
-                            # so a turn the processor is still working
-                            # on when the call ends cannot be answered
-                            # into the next call.
-                            audio_q.put((_call_gen, pcm, duration, vad_metrics, tentative))
 
                             speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
 
@@ -1354,7 +1316,7 @@ def processor_thread():
         try:
             # gen travels with the utterance and is stamped onto whatever
             # reply this turn produces, however long Gemini/TTS take.
-            gen, pcm, duration, vad_metrics, tentative = audio_q.get(timeout=1)
+            gen, pcm, duration, vad_metrics = audio_q.get(timeout=1)
         except queue.Empty:
             continue
 
@@ -1370,22 +1332,7 @@ def processor_thread():
             vad_row = dict(vad_metrics)
             vad_row["transcript_len_words"] = len(transcript.split()) if transcript else 0
             vad_row["truncated_suspect"] = 1 if _is_truncated_suspect(transcript) else 0
-            vad_row["tentative"] = 1 if tentative else 0
             _write_vad_metrics_row(vad_row)
-
-            if tentative and not (transcript and _is_stop_request(transcript)):
-                # Too short to have cleared the normal onset guard —
-                # only worth anything if it turned out to be a curt
-                # command word ("stop"/"chup"/"rukja"). Anything else
-                # here (empty, or real words that aren't a stop
-                # request) is discarded completely silently: no
-                # apology, no Gemini call, no history entry. This is
-                # what lets SPEECH_MIN_FRAMES stay high enough to
-                # reject ordinary background noise while still
-                # catching genuinely short stop-commands the normal
-                # guard would otherwise swallow.
-                log.debug(f"[REC] Tentative short capture discarded: '{transcript}'")
-                continue
 
             if not transcript:
                 if language_code == "ERROR":
@@ -1754,11 +1701,9 @@ def main():
     # -reference which env vars were set for a given run's [VAD] lines.
     log.info(
         "[VAD-CONFIG] mode=%d frame_ms=%d hangover_ms=%d (=%d frames) "
-        "min_utterance_ms=%d min_speech_frames=%d stop_check_min_frames=%d "
-        "energy_threshold=%.0f sample_rate=%d",
+        "min_utterance_ms=%d energy_threshold=%.0f sample_rate=%d",
         VAD_MODE, VAD_FRAME_MS, VAD_HANGOVER_MS, SILENCE_FRAMES,
-        VAD_MIN_UTTERANCE_MS, VAD_MIN_SPEECH_FRAMES, VAD_STOP_CHECK_MIN_FRAMES,
-        VAD_ENERGY_THRESHOLD, SAMPLE_RATE,
+        VAD_MIN_UTTERANCE_MS, VAD_ENERGY_THRESHOLD, SAMPLE_RATE,
     )
 
     log.info("AI Caller — Final (Google Cloud edition)")
