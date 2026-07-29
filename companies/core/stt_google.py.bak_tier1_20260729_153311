@@ -55,19 +55,6 @@ def _get_client():
     return _client
 
 
-def warmup():
-    """
-    Forces the SpeechClient's credential loading and gRPC channel setup
-    to happen at process boot instead of on the first real caller's
-    utterance. Constructing the client is enough for the auth handshake
-    to run — unlike TTS/LLM there's no free trivial STT call to make
-    (any real request needs actual audio), so this doesn't fire a
-    dummy recognize() call, just eagerly builds the client.
-    """
-    _get_client()
-    log.info("[STT] Client warmed.")
-
-
 def _get_recognizer() -> str:
     project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     return f"projects/{project}/locations/{STT_LOCATION}/recognizers/_"

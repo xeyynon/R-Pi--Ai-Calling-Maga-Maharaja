@@ -374,16 +374,10 @@ HALLUCINATION_PHRASES = (
 )
 
 # Timing
-GREETING_DELAY_SEC = float(os.getenv("GREETING_DELAY_SEC", "1.0"))
-                         # Was set to 0 at an earlier point in this project
-                         # ("removed per request"), which meant the greeting
-                         # fired the instant the Bluetooth SCO link came up —
-                         # before the caller had the phone at their ear or the
-                         # link had stabilized, clipping/pre-empting the start
-                         # of the call. Restored to 1.0s. Env-configurable so
-                         # this can be tuned (a real phone-in-hand test is the
-                         # only way to know the right value) without a
-                         # redeploy per attempt.
+GREETING_DELAY_SEC = 0  # removed per request — was 1.0s to let the SCO
+                         # link stabilize before speaking; if the greeting's
+                         # opening word(s) come out clipped on real calls,
+                         # that's the trade-off of setting this back to 0
 WATCHDOG_SEC   = 3     # Bluetooth poll interval
 
 # _kill_loopback_links() itself was only ever being called once per
@@ -403,17 +397,11 @@ CALL_END_DEBOUNCE_POLLS = 2  # consecutive missed polls (~2*WATCHDOG_SEC)
                               # before believing a call really ended, not
                               # just a transient Bluetooth node blip
 RECONNECT_SEC  = 2     # wait before reopening stream after call drop
-# Silence after a chunk's pw-play call returns, before either (a) the
-# mic resumes, or (b) the NEXT sentence-chunk of the same reply starts
-# playing. Bluetooth SCO has extra buffering/RF latency beyond what
-# pw-play returning implies — the old 0.4s let the reply's own tail
-# leak into the mic and get transcribed as a new caller utterance.
-# (A "simultaneous audio" symptom was investigated by bumping this to
-# 2.0s — root cause turned out to be two separate ai_caller_final2.py
-# processes both alive and both answering the same call, unrelated to
-# this value. Reverted back to the known-good 1.2s.) Env-configurable
-# for the same reason the VAD constants are.
-ECHO_TAIL_SEC = float(os.getenv("ECHO_TAIL_SEC", "1.2"))
+ECHO_TAIL_SEC  = 1.2   # silence after TTS before mic resumes — Bluetooth SCO
+                       # has extra buffering/RF latency beyond what pw-play
+                       # returning implies, so the old 0.4s let the tail end
+                       # of the bot's own reply leak into the mic and get
+                       # transcribed as a new caller utterance
 
 # Barge-in checkpoint window: how long, after each sentence-chunk's
 # mandatory ECHO_TAIL_SEC mute, the recorder stays genuinely live

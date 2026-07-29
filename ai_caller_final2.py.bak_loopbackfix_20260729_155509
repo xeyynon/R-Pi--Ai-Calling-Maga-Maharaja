@@ -374,46 +374,20 @@ HALLUCINATION_PHRASES = (
 )
 
 # Timing
-GREETING_DELAY_SEC = float(os.getenv("GREETING_DELAY_SEC", "1.0"))
-                         # Was set to 0 at an earlier point in this project
-                         # ("removed per request"), which meant the greeting
-                         # fired the instant the Bluetooth SCO link came up —
-                         # before the caller had the phone at their ear or the
-                         # link had stabilized, clipping/pre-empting the start
-                         # of the call. Restored to 1.0s. Env-configurable so
-                         # this can be tuned (a real phone-in-hand test is the
-                         # only way to know the right value) without a
-                         # redeploy per attempt.
+GREETING_DELAY_SEC = 0  # removed per request — was 1.0s to let the SCO
+                         # link stabilize before speaking; if the greeting's
+                         # opening word(s) come out clipped on real calls,
+                         # that's the trade-off of setting this back to 0
 WATCHDOG_SEC   = 3     # Bluetooth poll interval
-
-# _kill_loopback_links() itself was only ever being called once per
-# WATCHDOG_SEC (3s) — fine for node detection, but WirePlumber
-# recreates the alsa_output<->bluez monitor loopback far faster than
-# that on its own, so the link was live again for a real chunk of
-# each 3s window before the next poll cut it — a caller-audible
-# periodic echo/feedback for the entire call, reported as a
-# continuous rhythmic "beating" sound from start to end. Runs in its
-# own loop, independent of WATCHDOG_SEC and the call-detection/
-# debounce logic below, so this doesn't touch that already-tested
-# timing at all — just cuts the same already-existing link far more
-# often while a call is active.
-LOOPBACK_GUARD_SEC = 0.3
-
 CALL_END_DEBOUNCE_POLLS = 2  # consecutive missed polls (~2*WATCHDOG_SEC)
                               # before believing a call really ended, not
                               # just a transient Bluetooth node blip
 RECONNECT_SEC  = 2     # wait before reopening stream after call drop
-# Silence after a chunk's pw-play call returns, before either (a) the
-# mic resumes, or (b) the NEXT sentence-chunk of the same reply starts
-# playing. Bluetooth SCO has extra buffering/RF latency beyond what
-# pw-play returning implies — the old 0.4s let the reply's own tail
-# leak into the mic and get transcribed as a new caller utterance.
-# (A "simultaneous audio" symptom was investigated by bumping this to
-# 2.0s — root cause turned out to be two separate ai_caller_final2.py
-# processes both alive and both answering the same call, unrelated to
-# this value. Reverted back to the known-good 1.2s.) Env-configurable
-# for the same reason the VAD constants are.
-ECHO_TAIL_SEC = float(os.getenv("ECHO_TAIL_SEC", "1.2"))
+ECHO_TAIL_SEC  = 1.2   # silence after TTS before mic resumes — Bluetooth SCO
+                       # has extra buffering/RF latency beyond what pw-play
+                       # returning implies, so the old 0.4s let the tail end
+                       # of the bot's own reply leak into the mic and get
+                       # transcribed as a new caller utterance
 
 # Barge-in checkpoint window: how long, after each sentence-chunk's
 # mandatory ECHO_TAIL_SEC mute, the recorder stays genuinely live
@@ -718,25 +692,6 @@ def watchdog_thread():
         _shutdown.wait(WATCHDOG_SEC)
 
     log.info("Watchdog stopped.")
-
-
-def loopback_guard_thread():
-    """
-    Cuts the alsa_output<->bluez monitor loopback WirePlumber keeps
-    recreating, on a much tighter cadence than the main watchdog's
-    3s Bluetooth-node poll — see LOOPBACK_GUARD_SEC above for why.
-    Fully independent of watchdog_thread: reads _inp_node/_out_node
-    (already maintained by the watchdog) but doesn't touch call
-    detection, the greeting, or the debounce logic at all.
-    """
-    log.info("Loopback guard started.")
-    while not _shutdown.is_set():
-        with _node_lock:
-            active = bool(_inp_node and _out_node)
-        if active:
-            _kill_loopback_links()
-        _shutdown.wait(LOOPBACK_GUARD_SEC)
-    log.info("Loopback guard stopped.")
 
 
 # ─────────────────────────────────────────────────────
@@ -1876,7 +1831,6 @@ def main():
 
     threads = [
         threading.Thread(target=watchdog_thread,  daemon=True, name="watchdog"),
-        threading.Thread(target=loopback_guard_thread, daemon=True, name="loopback_guard"),
         threading.Thread(target=recorder_thread,  daemon=True, name="recorder"),
         threading.Thread(target=processor_thread, daemon=True, name="processor"),
         threading.Thread(target=playback_thread,  daemon=True, name="playback"),

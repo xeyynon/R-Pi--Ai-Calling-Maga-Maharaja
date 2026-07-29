@@ -33,32 +33,6 @@ def _get_client():
     return _client
 
 
-def warmup(model: str):
-    """
-    Forces client construction (credential loading) AND a real, minimal
-    generate_content call at process boot — unlike the STT/TTS clients,
-    google-genai's HTTP connection pool is only actually opened on the
-    first real request, so just constructing the client isn't enough to
-    warm it. A 1-token throwaway call is a small, one-time cost per
-    process start, in exchange for the first real caller not paying for
-    connection setup on their own turn.
-    """
-    client = _get_client()
-    try:
-        client.models.generate_content(
-            model=model,
-            contents=[types.Content(role="user", parts=[types.Part(text="hi")])],
-            config=types.GenerateContentConfig(
-                max_output_tokens=1,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
-            ),
-        )
-        log.info("[GEMINI] Client warmed.")
-    except Exception as e:
-        log.warning(f"[GEMINI] Warmup call failed (non-fatal, first real call will just be cold): {e}")
-
-
 def _split_system_and_turns(messages: list[dict]) -> tuple[str, list[types.Content]]:
     system_parts = []
     turns = []

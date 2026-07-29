@@ -73,23 +73,6 @@ def _get_client():
     return _client
 
 
-# All three languages this pipeline ever needs a voice for — warmed at
-# boot so the first real caller in any of them doesn't pay for the
-# list_voices() round trip + cache-miss the module docstring already
-# claimed happened "at startup" but previously only happened lazily on
-# each language's first real use.
-_WARMUP_LANGUAGES = ("en-IN", "hi-IN", "te-IN")
-
-
-def warmup():
-    """Pre-populates the voice cache for every supported language and
-    forces the TextToSpeechClient's credential/channel setup to happen
-    at process boot, not on the first caller's first reply."""
-    for lang in _WARMUP_LANGUAGES:
-        _pick_voice_for_language(lang)
-    log.info(f"[TTS] Client warmed, voices cached for {_WARMUP_LANGUAGES}.")
-
-
 def _normalize_language_code(language_code: str) -> str:
     """
     BCP-47 canonical casing (lang lowercase, region uppercase), e.g.

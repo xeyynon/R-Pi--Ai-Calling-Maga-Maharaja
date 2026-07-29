@@ -374,16 +374,10 @@ HALLUCINATION_PHRASES = (
 )
 
 # Timing
-GREETING_DELAY_SEC = float(os.getenv("GREETING_DELAY_SEC", "1.0"))
-                         # Was set to 0 at an earlier point in this project
-                         # ("removed per request"), which meant the greeting
-                         # fired the instant the Bluetooth SCO link came up —
-                         # before the caller had the phone at their ear or the
-                         # link had stabilized, clipping/pre-empting the start
-                         # of the call. Restored to 1.0s. Env-configurable so
-                         # this can be tuned (a real phone-in-hand test is the
-                         # only way to know the right value) without a
-                         # redeploy per attempt.
+GREETING_DELAY_SEC = 0  # removed per request — was 1.0s to let the SCO
+                         # link stabilize before speaking; if the greeting's
+                         # opening word(s) come out clipped on real calls,
+                         # that's the trade-off of setting this back to 0
 WATCHDOG_SEC   = 3     # Bluetooth poll interval
 
 # _kill_loopback_links() itself was only ever being called once per
