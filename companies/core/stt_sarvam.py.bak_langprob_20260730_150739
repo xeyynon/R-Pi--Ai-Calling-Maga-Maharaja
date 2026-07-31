@@ -114,7 +114,7 @@ STREAMING_FINISH_TIMEOUT_SEC = 20
 # end of the buffer.
 STREAMING_GRACE_SEC = float(os.getenv("SARVAM_STREAMING_GRACE_SEC", "1.5"))
 
-# 2026-07-30: recorder_thread's async-finish fix (see ai_caller_final3.py)
+# 2026-07-30: recorder_thread's async-finish fix (see ai_caller_final2.py)
 # correctly stopped blocking mic capture on a slow STT call, but it also
 # removed the one thing that used to guarantee only ONE Sarvam call was
 # ever in flight at a time — every utterance now spawns its own thread,
@@ -128,20 +128,11 @@ STREAMING_GRACE_SEC = float(os.getenv("SARVAM_STREAMING_GRACE_SEC", "1.5"))
 # a real caller's utterances are naturally sequential anyway (nobody
 # has two genuine utterances in flight at once), so serializing Sarvam
 # calls costs nothing real while preventing unbounded concurrent
-# connections. Started conservative (1) since Sarvam's actual
-# concurrent-connection limit for this account is unknown, with an
-# explicit note to raise it once real-call testing showed it
-# unnecessarily serializing genuinely distinct, back-to-back
-# utterances — which is exactly what happened, twice, 2026-07-31: a
-# short, low-energy "tentative" onset (background noise, not real
-# speech) still spawns a full real Sarvam session, and a second
-# genuine utterance just 5 seconds later had to queue 14.6s behind it
-# for the ONE available slot. Raised to 2 so one likely-noise
-# tentative capture can no longer single-handedly block a real,
-# immediately-following utterance. Sarvam's true per-account limit is
-# still unverified — watch for new connection-rejection errors (not
-# just timeouts) if this needs revisiting.
-SARVAM_MAX_CONCURRENT_SESSIONS = int(os.getenv("SARVAM_MAX_CONCURRENT_SESSIONS", "2"))
+# connections. Start conservative (1) since Sarvam's actual concurrent-
+# connection limit for this account is unknown; raise if real-call
+# testing shows this is unnecessarily serializing genuinely distinct,
+# back-to-back utterances.
+SARVAM_MAX_CONCURRENT_SESSIONS = int(os.getenv("SARVAM_MAX_CONCURRENT_SESSIONS", "1"))
 _sarvam_concurrency = threading.Semaphore(SARVAM_MAX_CONCURRENT_SESSIONS)
 
 # 2026-07-30: real-call testing showed Sarvam's auto language-ID
@@ -153,41 +144,14 @@ _sarvam_concurrency = threading.Semaphore(SARVAM_MAX_CONCURRENT_SESSIONS)
 # in Gujarati to a caller who never said a word of it. This business
 # only ever serves English/Hindi/Telugu callers — there is no
 # legitimate reason a real utterance should ever need a 5th language.
-# Restricting accepted results to the business's actual supported
-# languages is a cheap, well-targeted proxy: every CROSS-language
+# Sarvam's API doesn't expose a confidence score to filter on
+# directly, but restricting accepted results to the business's actual
+# supported languages is a cheap, well-targeted proxy: every
 # hallucination observed landed on an unsupported language tag, and
 # every genuine utterance (even short ones like "Hello"/"Okay")
 # landed on one of these three. Anything else is treated as no speech
 # — same downstream handling as silence, not a wrong-language reply.
 SUPPORTED_LANGUAGE_CODES = {"en-in", "hi-in", "te-in"}
-
-# 2026-07-30: the language-code filter above only catches
-# CROSS-language hallucinations. A regression test against real
-# captured audio (stt_regression_test.py) found a second failure mode
-# it can't touch: silence/noise hallucinated into a plausible-looking
-# phrase in a SUPPORTED language — e.g. 'इस तक कि।' (Hindi filler,
-# lang_probability=0.118) and a Malayalam-script hallucination tagged
-# en-IN-adjacent nonsense (lang_probability=0.14), both from utterances
-# where a DIFFERENT STT engine (Google) independently found "no
-# speech" in the same audio. This field is genuinely exposed by
-# Sarvam's API (SpeechToTextTranscriptionData.language_probability) —
-# not a guessed heuristic like energy or word-count, both of which
-# were checked first and rejected for real, demonstrated overlap with
-# legitimate quiet speech.
-#
-# Threshold recalibrated 2026-07-30 after a real call showed 0.5 was
-# too aggressive: it discarded two GENUINE utterances — "Repeat in
-# Hindi" (0.41) and "मगा महाराजा क्या है?" ("what is Maga Maharaja?",
-# 0.39) — silently, forcing the caller to repeat themselves. Combined
-# evidence now available: confirmed hallucinations score 0.118-0.14;
-# confirmed genuine-but-rejected utterances score 0.39-0.41; confirmed
-# genuine, correctly-accepted utterances score 1.0. 0.25 sits in the
-# real gap between the hallucination cluster and the legitimate-content
-# cluster — catches the demonstrated hallucinations without repeating
-# the false-positive that just happened. Still an approximation with
-# only a handful of data points either side; revisit if either failure
-# mode recurs.
-SARVAM_MIN_LANGUAGE_PROBABILITY = float(os.getenv("SARVAM_MIN_LANGUAGE_PROBABILITY", "0.25"))
 
 _client = None
 
@@ -195,7 +159,7 @@ _client = None
 def _get_client() -> SarvamAI:
     # Read fresh, not frozen at import time — matches stt_google.py's
     # _get_recognizer() pattern. SARVAM_API_KEY has a local_config.py
-    # fallback wired in ai_caller_final3.py that runs AFTER this
+    # fallback wired in ai_caller_final2.py that runs AFTER this
     # module's own top-of-file imports; freezing it as a module-level
     # constant here (the original version of this file did) reads ""
     # every time, since the fallback hasn't landed in os.environ yet
@@ -270,24 +234,12 @@ def _call_sarvam(wav_bytes: bytes) -> tuple[str, str]:
                       or (response.get("language_code") if isinstance(response, dict) else None)
                       or "")
 
-    language_probability = (getattr(response, "language_probability", None)
-                             or (response.get("language_probability") if isinstance(response, dict) else None))
-
     if transcript and language_code.lower() not in SUPPORTED_LANGUAGE_CODES:
         log.warning(
             f"[STT-SARVAM] Discarding '{transcript}' — tagged "
             f"{language_code!r}, not one of this business's supported "
             f"languages (likely a hallucination from noise, not real "
             f"speech in an unsupported language)."
-        )
-        return "", ""
-
-    if transcript and language_probability is not None and language_probability < SARVAM_MIN_LANGUAGE_PROBABILITY:
-        log.warning(
-            f"[STT-SARVAM] Discarding '{transcript}' — "
-            f"language_probability={language_probability:.2f} is below "
-            f"{SARVAM_MIN_LANGUAGE_PROBABILITY} (likely a same-language "
-            f"hallucination from noise, not confident real speech)."
         )
         return "", ""
 
@@ -317,29 +269,10 @@ class StreamingSession:
     batch version, where latest_partial never populated at all.
     """
 
-    def __init__(self, language_code: str | None = None, is_stale=None):
-        # Defaults to "unknown" (auto-detect across all supported
-        # languages). A caller (ai_caller_final3.py, once a call's
-        # language is locked) can instead pass a specific BCP-47 code
-        # (e.g. "hi-IN") to skip auto-detect for the rest of the call.
-        self._language_code = language_code or SARVAM_STREAMING_LANGUAGE_CODE
-        # 2026-07-31: real call log showed background-noise onset
-        # triggers spawning several StreamingSessions in a row, each
-        # queueing for the single SARVAM_MAX_CONCURRENT_SESSIONS slot —
-        # and NONE of them got cancelled when the call that spawned
-        # them ended. Each one still had to wait its full turn (up to
-        # STREAMING_FINISH_TIMEOUT_SEC) before releasing the slot,
-        # compounding into a backlog that measurably delayed the NEXT
-        # call's own STT (observed: 34.7s/28.8s/25.0s/24.7s waits
-        # logged AFTER the next call had already started). is_stale, if
-        # given, is polled while waiting for the slot — a session whose
-        # call has already ended abandons immediately instead of
-        # consuming its turn in the queue.
-        self._is_stale = is_stale
+    def __init__(self):
         self._sync_queue = queue.Queue()  # feed() is called from recorder_thread (sync)
         self._result_transcript = ""
         self._result_language = ""
-        self._result_language_probability = 1.0  # absent field => trust it
         self._error = None
         self.latest_partial = ""
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
@@ -354,14 +287,6 @@ class StreamingSession:
         if self._thread.is_alive():
             log.error("[STT-SARVAM] Timed out waiting for streaming result.")
             return "", "ERROR"
-        if isinstance(self._error, str) and self._error.startswith("stale"):
-            # Abandoned while waiting for a concurrency slot because its
-            # call already ended — not a real failure, and "ERROR"
-            # would make the caller speak an apology into a call that's
-            # already over (and get discarded downstream anyway, but
-            # only after wasting a TTS call). Treat it like clean
-            # silence instead.
-            return "", ""
         if self._error:
             log.error(f"[STT-SARVAM] {self._error}")
             return "", "ERROR"
@@ -376,14 +301,6 @@ class StreamingSession:
                 f"noise, not real speech in an unsupported language)."
             )
             return "", ""
-        if transcript and self._result_language_probability < SARVAM_MIN_LANGUAGE_PROBABILITY:
-            log.warning(
-                f"[STT-SARVAM] Discarding '{transcript}' — "
-                f"language_probability={self._result_language_probability:.2f} is "
-                f"below {SARVAM_MIN_LANGUAGE_PROBABILITY} (likely a same-language "
-                f"hallucination from noise, not confident real speech)."
-            )
-            return "", ""
         if transcript:
             log.info(f"[STT-SARVAM] '{transcript}' (lang={language_code}, streaming)")
         else:
@@ -392,18 +309,7 @@ class StreamingSession:
 
     def _run_thread(self):
         t_wait0 = time.time()
-        acquired = False
-        while True:
-            if self._is_stale is not None and self._is_stale():
-                log.info(
-                    "[STT-SARVAM] Abandoning session while waiting for a "
-                    "streaming slot — its call already ended."
-                )
-                self._error = "stale — call ended before a streaming slot freed up"
-                return
-            if _sarvam_concurrency.acquire(timeout=0.5):
-                acquired = True
-                break
+        _sarvam_concurrency.acquire()
         wait_s = time.time() - t_wait0
         if wait_s > 0.5:
             log.warning(
@@ -429,7 +335,7 @@ class StreamingSession:
         async with client.speech_to_text_streaming.connect(
             model=SARVAM_MODEL,
             mode=SARVAM_MODE,
-            language_code=self._language_code,
+            language_code=SARVAM_STREAMING_LANGUAGE_CODE,
             high_vad_sensitivity=True,
             vad_signals=True,
         ) as ws:
@@ -475,9 +381,6 @@ class StreamingSession:
                             lang = getattr(message.data, "language_code", None)
                             if lang:
                                 self._result_language = lang
-                            prob = getattr(message.data, "language_probability", None)
-                            if prob is not None:
-                                self._result_language_probability = prob
                             got_transcript.set()
 
             send_task = asyncio.create_task(sender())
@@ -505,21 +408,8 @@ class StreamingSession:
                 pass
 
 
-def start_streaming_session(language_code: str | None = None, is_stale=None) -> StreamingSession:
-    """
-    language_code=None (default): "unknown", Sarvam auto-detects across
-    all supported languages. Pass a specific BCP-47 code (e.g. "hi-IN")
-    to skip auto-detect — used for session-sticky language locking once
-    a call's language is confirmed. Confirmed working on a real call
-    2026-07-31 (session-sticky en-IN held for the whole call).
-
-    is_stale: optional zero-arg callable, polled while this session
-    waits for a free SARVAM_MAX_CONCURRENT_SESSIONS slot. If it returns
-    True, the session abandons the wait immediately instead of
-    consuming its turn in the queue — see StreamingSession's docstring
-    for the real backlog this fixes.
-    """
-    return StreamingSession(language_code, is_stale)
+def start_streaming_session() -> StreamingSession:
+    return StreamingSession()
 
 
 if __name__ == "__main__":

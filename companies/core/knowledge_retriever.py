@@ -28,6 +28,7 @@ where real embeddings would start to pay for themselves.
 
 import logging
 import re
+import threading
 from pathlib import Path
 
 log = logging.getLogger("knowledge_retriever")
@@ -133,3 +134,61 @@ def get_relevant_context(company_dir: Path, transcript: str) -> str:
         context += section + "\n\n"
 
     return context.strip() or scored_sections[0][1][:MAX_CONTEXT_CHARS]
+
+
+# ─────────────────────────────────────────────────────
+# SPECULATIVE RETRIEVAL — retrieval here is already fast (local
+# keyword scoring, no network, cached file reads), so the win from
+# running it "speculatively" is genuinely modest — a few milliseconds,
+# not the seconds-level wins elsewhere in this pipeline. What it does
+# buy: that small cost now overlaps the time the caller is STILL
+# TALKING (via streaming STT's interim/partial transcripts) instead of
+# happening only after they've finished, which was previously dead
+# time downstream (Gemini/TTS can't start until retrieval is done
+# anyway). Kept intentionally simple given the small expected payoff —
+# a single-slot cache, not a full per-turn keyed store, on the
+# reasoning that only one utterance is ever actually in flight at a
+# time in this pipeline's threading model.
+# ─────────────────────────────────────────────────────
+
+_speculative_lock = threading.Lock()
+_speculative_partial = ""
+_speculative_context: str | None = None
+
+
+def prefetch_relevant_context(company_dir: Path, partial_transcript: str) -> None:
+    """
+    Speculatively computes and caches the RAG context for a still-in-
+    progress utterance's latest interim transcript. Call this from a
+    background thread — it does the same work get_relevant_context()
+    does, just earlier, on a partial rather than the final transcript.
+    """
+    global _speculative_partial, _speculative_context
+    context = get_relevant_context(company_dir, partial_transcript)
+    with _speculative_lock:
+        _speculative_partial = partial_transcript
+        _speculative_context = context
+
+
+def get_relevant_context_maybe_cached(company_dir: Path, final_transcript: str) -> str:
+    """
+    Reuses a speculative result from prefetch_relevant_context() if the
+    final transcript's words are a superset of what the speculative
+    call was based on — retrieval is coarse topic-matching, so a final
+    transcript that just continues past its own earlier partial almost
+    always still matches the same sections. Falls back to a normal
+    (still fast, local) call otherwise, so this is never worse than
+    the non-speculative path, only sometimes faster.
+    """
+    with _speculative_lock:
+        cached_partial = _speculative_partial
+        cached_context = _speculative_context
+
+    if cached_partial and cached_context is not None:
+        partial_words = set(re.findall(r"\w+", cached_partial.lower()))
+        final_words = set(re.findall(r"\w+", final_transcript.lower()))
+        if partial_words and partial_words.issubset(final_words):
+            log.debug(f"[KNOWLEDGE] Reusing speculative context (partial: '{cached_partial}')")
+            return cached_context
+
+    return get_relevant_context(company_dir, final_transcript)

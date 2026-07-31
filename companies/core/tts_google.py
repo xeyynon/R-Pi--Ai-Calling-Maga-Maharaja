@@ -16,11 +16,14 @@ automatically start using them without a code change.
 """
 
 import logging
+import queue
 import re
+import threading
 import time
 from xml.sax.saxutils import escape as _xml_escape
 
 from google.cloud import texttospeech
+from google.cloud import texttospeech_v1beta1 as texttospeech_streaming
 
 from .retry import with_retry
 
@@ -53,6 +56,14 @@ _voice_cache: dict[str, str] = {}  # language_code -> voice name
 _DIGIT_RUN_PATTERN = re.compile(r"\d{6,}")
 
 
+def needs_digit_spelling(text: str) -> bool:
+    """True if `text` contains a long digit run (phone number, UPI ID)
+    that the SSML digit-by-digit trick applies to — streaming
+    synthesis has no SSML support, so the caller should fall back to
+    the blocking synthesize() for any sentence this returns True for."""
+    return bool(_DIGIT_RUN_PATTERN.search(text))
+
+
 def _to_ssml(text: str) -> str:
     """Wraps long digit runs in <say-as interpret-as="characters">
     so they're read digit-by-digit instead of as one giant number."""
@@ -82,12 +93,31 @@ _WARMUP_LANGUAGES = ("en-IN", "hi-IN", "te-IN")
 
 
 def warmup():
-    """Pre-populates the voice cache for every supported language and
+    """
+    Pre-populates the voice cache for every supported language and
     forces the TextToSpeechClient's credential/channel setup to happen
-    at process boot, not on the first caller's first reply."""
+    at process boot, not on the first caller's first reply.
+
+    Also warms the SEPARATE streaming client (texttospeech_v1beta1) —
+    this is a genuinely different client object from the one above, so
+    warming the default client alone left it cold. Measured: first
+    streamed sentence of a whole process's life took 2.4s to first
+    chunk instead of the ~0.25s every sentence after it got, entirely
+    client/channel setup cost. A tiny real streaming call here (not
+    just constructing the client) pays that cost once at boot instead
+    of on a real caller's first streamed reply.
+    """
     for lang in _WARMUP_LANGUAGES:
         _pick_voice_for_language(lang)
     log.info(f"[TTS] Client warmed, voices cached for {_WARMUP_LANGUAGES}.")
+
+    try:
+        synth = start_streaming_synthesis("hi", DEFAULT_LANGUAGE)
+        for _ in synth.chunks():
+            pass
+        log.info(f"[TTS-STREAM] Client warmed (failed={synth.failed}).")
+    except Exception as e:
+        log.warning(f"[TTS-STREAM] Warmup call failed (non-fatal, first real call will just be cold): {e}")
 
 
 def _normalize_language_code(language_code: str) -> str:
@@ -182,3 +212,112 @@ def synthesize(text: str, language_code: str = DEFAULT_LANGUAGE) -> bytes | None
     except Exception as e:
         log.error(f"[TTS] Google TTS failed: {e}")
         return None
+
+
+# ─────────────────────────────────────────────────────
+# STREAMING — first audio chunk arrives in ~0.25s instead of waiting
+# for the whole sentence to synthesize (measured 0.86-1.6s on real
+# calls for the blocking call above). Verified against real synthesis
+# before writing this: same voice, PCM encoding (not LINEAR16 — that
+# encoding is rejected for streaming, "Unsupported audio encoding"),
+# 16kHz, headerless raw chunks matching what the rest of the pipeline
+# already expects.
+#
+# StreamingSynthesisInput has no `ssml` field (only text/markup/
+# multi_speaker_markup/prompt), so the digit-run spelling-out trick
+# _to_ssml() does (reading a phone number/UPI ID digit-by-digit) can't
+# be ported directly — the caller of this module falls back to the
+# blocking synthesize() above for any sentence containing a long digit
+# run, and only streams the common case that doesn't need it.
+# ─────────────────────────────────────────────────────
+
+SAMPLE_RATE = 16000
+
+_streaming_client = None
+
+
+def _get_streaming_client():
+    global _streaming_client
+    if _streaming_client is None:
+        _streaming_client = texttospeech_streaming.TextToSpeechClient()
+    return _streaming_client
+
+
+class StreamingSynthesis:
+    """
+    Runs Google Cloud TTS's StreamingSynthesize call in its own daemon
+    thread, exposing raw 16kHz mono s16 PCM chunks via a queue as they
+    arrive. A consumer (playback_thread) can start playing the first
+    chunk long before the rest of the sentence has finished
+    synthesizing, instead of waiting on one blocking synthesize_speech
+    call that only returns once the entire clip is ready.
+    """
+
+    def __init__(self, text: str, language_code: str):
+        self._queue: queue.Queue = queue.Queue()
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run, args=(text, language_code), daemon=True
+        )
+        self._thread.start()
+
+    def chunks(self):
+        """Generator yielding raw PCM chunks; ends when the stream
+        finishes normally OR failed — check .failed after exhausting
+        to tell the two apart."""
+        while True:
+            chunk = self._queue.get()
+            if chunk is None:
+                return
+            yield chunk
+
+    @property
+    def failed(self) -> bool:
+        return self._error is not None
+
+    def _run(self, text: str, language_code: str):
+        client = _get_streaming_client()
+        language_code = _normalize_language_code(language_code)
+        voice_name = _pick_voice_for_language(language_code)
+        if not voice_name:
+            language_code = DEFAULT_LANGUAGE
+            voice_name = _pick_voice_for_language(DEFAULT_LANGUAGE)
+
+        streaming_config = texttospeech_streaming.StreamingSynthesizeConfig(
+            voice=texttospeech_streaming.VoiceSelectionParams(
+                language_code=language_code,
+                name=voice_name if voice_name else None,
+            ),
+            streaming_audio_config=texttospeech_streaming.StreamingAudioConfig(
+                audio_encoding=texttospeech_streaming.AudioEncoding.PCM,
+                sample_rate_hertz=SAMPLE_RATE,
+            ),
+        )
+
+        def requests():
+            yield texttospeech_streaming.StreamingSynthesizeRequest(
+                streaming_config=streaming_config,
+            )
+            yield texttospeech_streaming.StreamingSynthesizeRequest(
+                input=texttospeech_streaming.StreamingSynthesisInput(text=text),
+            )
+
+        t0 = time.time()
+        n_chunks = 0
+        try:
+            for response in client.streaming_synthesize(requests()):
+                if response.audio_content:
+                    n_chunks += 1
+                    self._queue.put(bytes(response.audio_content))
+        except Exception as e:
+            self._error = str(e)
+            log.error(f"[TTS-STREAM] {e}")
+        finally:
+            self._queue.put(None)  # sentinel: no more chunks
+
+        if not self._error:
+            log.info(f"[TTS-STREAM] ({language_code}, {n_chunks} chunks, {time.time()-t0:.2f}s)")
+
+
+def start_streaming_synthesis(text: str, language_code: str) -> StreamingSynthesis:
+    return StreamingSynthesis(text, language_code)

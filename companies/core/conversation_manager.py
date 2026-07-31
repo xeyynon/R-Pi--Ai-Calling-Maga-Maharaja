@@ -18,7 +18,7 @@ import re
 
 import yaml
 
-from .knowledge_retriever import get_core_context, get_relevant_context
+from .knowledge_retriever import get_core_context, get_relevant_context_maybe_cached
 from .llm_gemini import ask as gemini_ask, stream as gemini_stream
 from .validator import validate_reply
 
@@ -93,10 +93,16 @@ class ConversationManager:
 
     def _build_messages(self, transcript: str, recent_history: list[dict], context: str, detected_language: str):
         is_first_turn = not recent_history
-        # get_relevant_context() must see the caller's actual words, not
-        # the language-reminder wrapper added below, so this uses the
-        # raw transcript, before any modification.
-        knowledge = get_relevant_context(self.company_dir, transcript)
+        # get_relevant_context_maybe_cached() must see the caller's
+        # actual words, not the language-reminder wrapper added below,
+        # so this uses the raw transcript, before any modification.
+        # Reuses a speculative retrieval kicked off in recorder_thread
+        # on an earlier interim STT transcript (while the caller was
+        # still talking) if the final transcript is consistent with
+        # it, falling back to a normal (still fast, local) lookup
+        # otherwise — see knowledge_retriever.py for why this is a
+        # modest, not dramatic, win.
+        knowledge = get_relevant_context_maybe_cached(self.company_dir, transcript)
         system_prompt = self._build_system_prompt(context, knowledge, detected_language, is_first_turn)
 
         messages = [{"role": "system", "content": system_prompt}]

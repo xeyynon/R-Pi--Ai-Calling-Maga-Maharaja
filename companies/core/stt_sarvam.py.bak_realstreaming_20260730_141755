@@ -1,0 +1,266 @@
+"""
+stt_sarvam.py
+
+Sarvam AI speech-to-text integration — added 2026-07-30 as the third
+option in a three-way STT comparison (see stt_provider.py), specifically
+because Sarvam is purpose-built for Indian-language and code-switched
+("Hinglish"/"Teluglish") speech, which is exactly where both Google
+configs (telephony/en-IN and multilang/3-lang) have real, measured
+weaknesses (see the 2026-07-30 optimization review, §3/§6).
+
+Endpoint, auth, model name, and request/response shape below were
+confirmed by reading Sarvam's own docs (docs.sarvam.ai) on 2026-07-30:
+  - REST endpoint: POST https://api.sarvam.ai/speech-to-text
+  - Auth header:   api-subscription-key: <key>
+  - Request:       multipart form — file, model ("saaras:v3"),
+                    mode ("transcribe" | "translate" | "verbatim" |
+                    "translit" | "codemix")
+  - Response JSON: {"request_id", "transcript", "language_code"}
+  - Official SDK:  pip install -U sarvamai  ->  from sarvamai import SarvamAI
+
+====================================================================
+STILL NOT VERIFIED AGAINST A LIVE CALL. No API key was available in
+the environment this was written in — the shape above is read
+directly from Sarvam's documentation, not exercised against a real
+response. Run this module directly (see __main__ block) against a
+real key BEFORE trusting it on a live phone call — same lesson as the
+Google phrase-hint regression earlier today: a config that LOOKS
+right is not the same as one that has actually been called.
+====================================================================
+
+Sarvam ALSO has a genuine real-time streaming API (WebSocket, with
+interim results and start/end-of-speech VAD signals) — unlike what an
+earlier version of this file assumed. It is NOT implemented here yet:
+the Python SDK's streaming helper currently sends each audio chunk as
+its own wrapped WAV blob rather than a continuous raw PCM stream (an
+unusual, easy-to-get-wrong detail straight from Sarvam's own docs),
+and getting that framing wrong silently produces empty/garbled
+transcripts rather than a clean error. Given that risk, this file
+uses the plain batch REST endpoint (accumulate the whole utterance,
+one call at finish()) — the same trade-off the old pre-streaming
+Google code made, and an honest one, not a shortcut. The streaming
+upgrade is a real, valuable follow-up once the batch path is proven
+correct on this project's real audio — see the TODO in
+StreamingSession below for exactly what it would take.
+
+`mode="codemix"` is worth trying specifically for this project's
+biggest open problem (code-switched Hindi/Telugu/English in one
+utterance) — set SARVAM_MODE=codemix to test it; "transcribe" is the
+safer default for comparison against the two Google presets.
+"""
+
+import io
+import logging
+import os
+import threading
+import time
+import wave
+
+from sarvamai import SarvamAI
+
+log = logging.getLogger("stt_sarvam")
+
+SAMPLE_RATE = 16000  # matches the recorder's native capture rate —
+                      # Sarvam's REST endpoint takes a standard WAV
+                      # file, no forced-8kHz workaround needed the way
+                      # Google's telephony preset required.
+
+SARVAM_MODEL = os.environ.get("SARVAM_MODEL", "saaras:v3")
+# "transcribe" is the safe default; "codemix" is the mode most directly
+# relevant to this project's real problem (code-switched speech) — see
+# module docstring. Try both, they are NOT the same and may perform
+# very differently on real caller audio.
+SARVAM_MODE = os.environ.get("SARVAM_MODE", "transcribe")
+
+REQUEST_TIMEOUT_SEC = 20
+
+# 2026-07-30: real-call testing showed Sarvam's auto language-ID
+# confidently hallucinating short, grammatically real-looking phrases
+# in languages nobody was speaking, from what was almost certainly
+# noise/breathing/silence — e.g. 'আচ্ছা।' tagged bn-IN, 'बघा.' tagged
+# mr-IN, 'બાકીની જ રીતે છે.' tagged gu-IN, 'ಹ್ಞೂ.' tagged kn-IN, all in
+# one test call, with the Gujarati one actually making the bot reply
+# in Gujarati to a caller who never said a word of it. This business
+# only ever serves English/Hindi/Telugu callers — there is no
+# legitimate reason a real utterance should ever need a 5th language.
+# Sarvam's API doesn't expose a confidence score to filter on
+# directly, but restricting accepted results to the business's actual
+# supported languages is a cheap, well-targeted proxy: every
+# hallucination observed landed on an unsupported language tag, and
+# every genuine utterance (even short ones like "Hello"/"Okay")
+# landed on one of these three. Anything else is treated as no speech
+# — same downstream handling as silence, not a wrong-language reply.
+SUPPORTED_LANGUAGE_CODES = {"en-in", "hi-in", "te-in"}
+
+_client = None
+
+
+def _get_client() -> SarvamAI:
+    # Read fresh, not frozen at import time — matches stt_google.py's
+    # _get_recognizer() pattern. SARVAM_API_KEY has a local_config.py
+    # fallback wired in ai_caller_final2.py that runs AFTER this
+    # module's own top-of-file imports; freezing it as a module-level
+    # constant here (the original version of this file did) reads ""
+    # every time, since the fallback hasn't landed in os.environ yet
+    # by then — a real bug caught by boot-testing on 2026-07-30.
+    global _client
+    api_key = os.environ.get("SARVAM_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "SARVAM_API_KEY is not set. See the setup instructions given "
+            "alongside this integration."
+        )
+    if _client is None:
+        _client = SarvamAI(api_subscription_key=api_key)
+    return _client
+
+
+def warmup():
+    """
+    Constructing the client only validates that a key is PRESENT, not
+    that it's valid or that the endpoint is reachable — there is no
+    free trivial call the way Google's client construction doubles as
+    an auth handshake. A genuine end-to-end check needs real audio;
+    run this module directly against a captured WAV first.
+    """
+    _get_client()
+    log.info(
+        f"[STT-SARVAM] Key present, model={SARVAM_MODEL} mode={SARVAM_MODE}. "
+        f"NOT verified against a live call yet — see stt_sarvam.py's "
+        f"module docstring, and run it directly against a real WAV first."
+    )
+
+
+def _pcm_to_wav_bytes(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _call_sarvam(wav_bytes: bytes) -> tuple[str, str]:
+    """
+    One-shot REST call via the official SDK. Returns (transcript,
+    language_code), same contract as stt_google.py's transcribe().
+    "" transcript means no speech recognized; "ERROR" language_code
+    means the request itself failed (network, auth, bad audio, etc.).
+    """
+    client = _get_client()
+    try:
+        t0 = time.time()
+        response = client.speech_to_text.transcribe(
+            file=io.BytesIO(wav_bytes),
+            model=SARVAM_MODEL,
+            mode=SARVAM_MODE,
+        )
+        elapsed = time.time() - t0
+    except Exception as e:
+        log.error(f"[STT-SARVAM] Request failed: {e}")
+        return "", "ERROR"
+
+    # The SDK returns a response object (not raw JSON) — support both
+    # attribute access (the documented shape) and dict access, in case
+    # the installed SDK version differs from what the docs describe.
+    transcript = (getattr(response, "transcript", None)
+                  or (response.get("transcript") if isinstance(response, dict) else None)
+                  or "").strip()
+    language_code = (getattr(response, "language_code", None)
+                      or (response.get("language_code") if isinstance(response, dict) else None)
+                      or "")
+
+    if transcript and language_code.lower() not in SUPPORTED_LANGUAGE_CODES:
+        log.warning(
+            f"[STT-SARVAM] Discarding '{transcript}' — tagged "
+            f"{language_code!r}, not one of this business's supported "
+            f"languages (likely a hallucination from noise, not real "
+            f"speech in an unsupported language)."
+        )
+        return "", ""
+
+    if transcript:
+        log.info(f"[STT-SARVAM] '{transcript}' (lang={language_code}, {elapsed:.2f}s)")
+    else:
+        log.info(f"[STT-SARVAM] No speech recognized ({elapsed:.2f}s)")
+    return transcript, language_code
+
+
+def transcribe(pcm: bytes) -> tuple[str, str]:
+    """Batch entry point, same contract as stt_google.py's transcribe()."""
+    return _call_sarvam(_pcm_to_wav_bytes(pcm))
+
+
+class StreamingSession:
+    """
+    NOT genuinely streaming (see module docstring) — presents the same
+    feed()/finish() interface as stt_google.py's StreamingSession so
+    ai_caller_final2.py's recorder_thread doesn't need provider-specific
+    branching, but internally just buffers every fed frame and makes
+    ONE Sarvam REST call in finish(). latest_partial is always "" —
+    no interim result exists here, so speculative RAG (which reads
+    latest_partial) gets no early signal under this provider. That's a
+    real, known trade-off of picking Sarvam via this file today, not a
+    bug — see the TODO below for the real streaming upgrade path.
+
+    TODO (real streaming upgrade, not done here — needs a live key to
+    get right): Sarvam's actual streaming API is a WebSocket, driven
+    through `AsyncSarvamAI(...).speech_to_text_streaming.connect(
+    model=..., mode=..., language_code=..., high_vad_sensitivity=True,
+    vad_signals=True)`, async, with `vad_signals=True` messages typed
+    "events" (START_SPEECH/END_SPEECH) and "data" (transcript). Since
+    recorder_thread is a plain (non-async) thread, this would need its
+    own thread running an asyncio event loop — the same shape
+    stt_google.py's StreamingSession already uses for gRPC, just with
+    asyncio instead of a blocking generator. The one real unresolved
+    detail is audio chunk framing: docs indicate the Python SDK's
+    per-call `encoding` is fixed to "audio/wav", implying each chunk
+    sent to `ws.transcribe(audio=..., encoding="audio/wav", ...)` may
+    need to be its own valid WAV file rather than a raw PCM fragment —
+    unconfirmed, and the kind of detail that fails silently (empty or
+    garbled transcripts) rather than with a clear error if wrong. Get
+    this right only against a real key and real audio, not from docs
+    alone.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self.latest_partial = ""  # never populated — see class docstring
+
+    def feed(self, chunk: bytes) -> None:
+        with self._lock:
+            self._buf += chunk
+
+    def finish(self) -> tuple[str, str]:
+        with self._lock:
+            pcm = bytes(self._buf)
+        if not pcm:
+            return "", ""
+        return _call_sarvam(_pcm_to_wav_bytes(pcm))
+
+
+def start_streaming_session() -> StreamingSession:
+    return StreamingSession()
+
+
+if __name__ == "__main__":
+    # Quick end-to-end check against a real Sarvam API key, using one
+    # of the WAV files already captured in the 2026-07-30 STT
+    # diagnostic (see stt_diagnose.py) — reuses real caller audio
+    # instead of needing a fresh call just to smoke-test this
+    # integration. Usage:
+    #   SARVAM_API_KEY=sk_... python3 stt_sarvam.py /path/to/utt.wav
+    #   SARVAM_API_KEY=sk_... SARVAM_MODE=codemix python3 stt_sarvam.py /path/to/utt.wav
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: SARVAM_API_KEY=... python3 stt_sarvam.py <wav_file>")
+        sys.exit(1)
+
+    with open(sys.argv[1], "rb") as f:
+        wav_bytes = f.read()
+    warmup()
+    transcript, lang = _call_sarvam(wav_bytes)
+    print(f"transcript={transcript!r} language_code={lang!r}")
