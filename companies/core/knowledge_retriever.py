@@ -55,6 +55,16 @@ CORE_FILENAME = "core/always_on.md"
 # needing to restart the process — checked via mtime, not a one-time
 # load.
 _sections_cache: dict[Path, tuple[float, list[str]]] = {}
+# 2026-07-31: read/written from both prefetch_relevant_context() (a
+# background/recorder-thread caller) and get_relevant_context_maybe_
+# cached() (the main turn-processing thread) — unlike _speculative_lock
+# below, which protects a similarly-shared cache in this same module,
+# this one had no lock. Not a corruption risk (dict ops are atomic
+# under the GIL), but two threads racing a cache miss for the same file
+# both re-read and re-split it before either writes back — wasted I/O,
+# and an inconsistency in this module's own locking discipline that
+# could confuse a future reader into thinking only half needs it.
+_sections_cache_lock = threading.Lock()
 
 
 def _split_sections(text: str) -> list[str]:
@@ -64,14 +74,15 @@ def _split_sections(text: str) -> list[str]:
 
 
 def _get_sections(file_path: Path) -> list[str]:
-    mtime = file_path.stat().st_mtime
-    cached = _sections_cache.get(file_path)
-    if cached and cached[0] == mtime:
-        return cached[1]
+    with _sections_cache_lock:
+        mtime = file_path.stat().st_mtime
+        cached = _sections_cache.get(file_path)
+        if cached and cached[0] == mtime:
+            return cached[1]
 
-    sections = _split_sections(file_path.read_text(encoding="utf-8"))
-    _sections_cache[file_path] = (mtime, sections)
-    return sections
+        sections = _split_sections(file_path.read_text(encoding="utf-8"))
+        _sections_cache[file_path] = (mtime, sections)
+        return sections
 
 
 def _score_section(section: str, query_words: set[str]) -> int:

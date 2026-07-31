@@ -44,6 +44,13 @@ REQUEST_TIMEOUT_SEC = 20
 
 _client = None
 _voice_cache: dict[str, str] = {}  # language_code -> voice name
+# 2026-07-31: read/written from both the main synthesize() call and
+# StreamingSynthesis._run()'s per-sentence daemon threads concurrently.
+# Without this, two threads racing a cache miss for the same not-yet-
+# cached language both fire a real list_voices() network round-trip
+# before either writes back — wasteful, not corrupting (last write
+# wins, same value either way), but cheap to just avoid outright.
+_voice_cache_lock = threading.Lock()
 
 # Phone numbers and UPI IDs get read as one huge cardinal number
 # ("nine billion...") by Google TTS's default number normalization,
@@ -77,10 +84,15 @@ def _to_ssml(text: str) -> str:
     return f"<speak>{''.join(parts)}</speak>"
 
 
+_client_lock = threading.Lock()
+
+
 def _get_client():
     global _client
     if _client is None:
-        _client = texttospeech.TextToSpeechClient()
+        with _client_lock:
+            if _client is None:
+                _client = texttospeech.TextToSpeechClient()
     return _client
 
 
@@ -138,6 +150,11 @@ def _normalize_language_code(language_code: str) -> str:
 
 def _pick_voice_for_language(language_code: str) -> str:
     """Looks up the best available voice for a language and caches it."""
+    with _voice_cache_lock:
+        return _pick_voice_for_language_locked(language_code)
+
+
+def _pick_voice_for_language_locked(language_code: str) -> str:
     if language_code in _voice_cache:
         return _voice_cache[language_code]
 
@@ -234,12 +251,15 @@ def synthesize(text: str, language_code: str = DEFAULT_LANGUAGE) -> bytes | None
 SAMPLE_RATE = 16000
 
 _streaming_client = None
+_streaming_client_lock = threading.Lock()
 
 
 def _get_streaming_client():
     global _streaming_client
     if _streaming_client is None:
-        _streaming_client = texttospeech_streaming.TextToSpeechClient()
+        with _streaming_client_lock:
+            if _streaming_client is None:
+                _streaming_client = texttospeech_streaming.TextToSpeechClient()
     return _streaming_client
 
 
@@ -276,35 +296,46 @@ class StreamingSynthesis:
         return self._error is not None
 
     def _run(self, text: str, language_code: str):
-        client = _get_streaming_client()
-        language_code = _normalize_language_code(language_code)
-        voice_name = _pick_voice_for_language(language_code)
-        if not voice_name:
-            language_code = DEFAULT_LANGUAGE
-            voice_name = _pick_voice_for_language(DEFAULT_LANGUAGE)
-
-        streaming_config = texttospeech_streaming.StreamingSynthesizeConfig(
-            voice=texttospeech_streaming.VoiceSelectionParams(
-                language_code=language_code,
-                name=voice_name if voice_name else None,
-            ),
-            streaming_audio_config=texttospeech_streaming.StreamingAudioConfig(
-                audio_encoding=texttospeech_streaming.AudioEncoding.PCM,
-                sample_rate_hertz=SAMPLE_RATE,
-            ),
-        )
-
-        def requests():
-            yield texttospeech_streaming.StreamingSynthesizeRequest(
-                streaming_config=streaming_config,
-            )
-            yield texttospeech_streaming.StreamingSynthesizeRequest(
-                input=texttospeech_streaming.StreamingSynthesisInput(text=text),
-            )
-
+        # 2026-07-31: the try/finally used to start AFTER client
+        # construction and voice selection — if either of those raised
+        # (bad credentials, network failure during channel setup, a
+        # quota error), the `finally: self._queue.put(None)` never ran,
+        # and any consumer blocked in chunks()'s `self._queue.get()`
+        # hung FOREVER. This directly threatened warmup(), which calls
+        # this exact path at process boot: a credential hiccup at
+        # startup would silently hang the whole process before "Ready"
+        # ever logged, with no exception, no log line, nothing. Now the
+        # try wraps the entire method body so the sentinel always goes
+        # out, regardless of where the failure happens.
         t0 = time.time()
         n_chunks = 0
         try:
+            client = _get_streaming_client()
+            language_code = _normalize_language_code(language_code)
+            voice_name = _pick_voice_for_language(language_code)
+            if not voice_name:
+                language_code = DEFAULT_LANGUAGE
+                voice_name = _pick_voice_for_language(DEFAULT_LANGUAGE)
+
+            streaming_config = texttospeech_streaming.StreamingSynthesizeConfig(
+                voice=texttospeech_streaming.VoiceSelectionParams(
+                    language_code=language_code,
+                    name=voice_name if voice_name else None,
+                ),
+                streaming_audio_config=texttospeech_streaming.StreamingAudioConfig(
+                    audio_encoding=texttospeech_streaming.AudioEncoding.PCM,
+                    sample_rate_hertz=SAMPLE_RATE,
+                ),
+            )
+
+            def requests():
+                yield texttospeech_streaming.StreamingSynthesizeRequest(
+                    streaming_config=streaming_config,
+                )
+                yield texttospeech_streaming.StreamingSynthesizeRequest(
+                    input=texttospeech_streaming.StreamingSynthesisInput(text=text),
+                )
+
             for response in client.streaming_synthesize(requests()):
                 if response.audio_content:
                     n_chunks += 1

@@ -40,6 +40,7 @@ import numpy as np
 import queue
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -288,6 +289,15 @@ TRUNCATION_MARKER_WORDS = {
 _vad_metrics_lock = threading.Lock()
 _vad_turn_counter = 0  # per-process monotonic counter, disambiguated by call_id (gen) alongside it
 
+# 2026-07-31: this file had no size cap, unlike the main log (which
+# deliberately got a RotatingFileHandler specifically for SD-card size
+# reasons) — left running for months, one row per utterance forever
+# would eventually contribute to filling the card. Diagnostic/tuning
+# data has limited long-term value past a certain size, unlike
+# CALL_DATA_DIR's training data below, so real rotation (drop the old
+# generation) is appropriate here.
+VAD_METRICS_MAX_BYTES = int(os.getenv("VAD_METRICS_MAX_BYTES", str(5 * 1024 * 1024)))  # 5MB, matches the main log
+
 
 def _init_vad_metrics_csv() -> None:
     VAD_METRICS_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -296,8 +306,21 @@ def _init_vad_metrics_csv() -> None:
             csv.writer(f).writerow(VAD_METRICS_CSV_HEADER)
 
 
+def _rotate_vad_metrics_if_needed() -> None:
+    try:
+        if VAD_METRICS_CSV_PATH.exists() and VAD_METRICS_CSV_PATH.stat().st_size >= VAD_METRICS_MAX_BYTES:
+            backup = VAD_METRICS_CSV_PATH.with_name(VAD_METRICS_CSV_PATH.name + ".1")
+            backup.unlink(missing_ok=True)
+            VAD_METRICS_CSV_PATH.rename(backup)
+            _init_vad_metrics_csv()
+            log.info(f"[VAD-METRICS] Rotated {VAD_METRICS_CSV_PATH.name} (reached {VAD_METRICS_MAX_BYTES} bytes).")
+    except OSError as e:
+        log.warning(f"[VAD-METRICS] Rotation check failed: {e}")
+
+
 def _write_vad_metrics_row(row: dict) -> None:
     with _vad_metrics_lock:
+        _rotate_vad_metrics_if_needed()
         with open(VAD_METRICS_CSV_PATH, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([row.get(col, "") for col in VAD_METRICS_CSV_HEADER])
 
@@ -467,7 +490,7 @@ RECONNECT_SEC  = 2     # wait before reopening stream after call drop
 # pw-play returning implies — the old 0.4s let the reply's own tail
 # leak into the mic and get transcribed as a new caller utterance.
 # (A "simultaneous audio" symptom was investigated by bumping this to
-# 2.0s — root cause turned out to be two separate ai_caller_final2.py
+# 2.0s — root cause turned out to be two separate ai_caller_final3.py
 # processes both alive and both answering the same call, unrelated to
 # this value. Reverted back to the known-good 1.2s.) Env-configurable
 # for the same reason the VAD constants are.
@@ -665,11 +688,14 @@ _call_gen   = 0
 # call yields a confirmed language, then every subsequent utterance's
 # StreamingSession is restricted to just that one language instead of
 # the full 3-candidate list — cuts STT ambiguity (and a little
-# latency) for the rest of the call. Reset at every call boundary in
-# _clear_history(). Written only by processor_thread (when it resolves
-# a turn's language), read only by recorder_thread (when it opens the
-# next utterance's StreamingSession) — same single-writer/no-lock
-# reasoning as _call_gen above.
+# latency) for the rest of the call. Read only by recorder_thread (no
+# lock needed there — a plain reference read is already atomic).
+# Written by TWO threads, not one: processor_thread (resolving a turn's
+# language) AND watchdog_thread (_clear_history(), resetting it at a
+# call boundary) — genuinely two writers, unlike _call_gen above, which
+# really does have only one. Both writes go through _hist_lock so a
+# hangup landing mid-turn can't race a language-lock write and silently
+# clobber it back to None.
 _locked_language_code: str | None = None
 
 _inp_node   = None
@@ -782,7 +808,13 @@ def _kill_loopback_links():
                     ["pw-link", "-d", src, dst],
                     capture_output=True, timeout=5
                 )
-                log.info(f"[AUDIO] Cut loopback link: {src} -> {dst}")
+                # 2026-07-31: downgraded from INFO — fires in bursts of
+                # 4-8 lines at every single call boundary (confirmed in
+                # every real-call test this session), genuinely
+                # voluminous at the default log level. Still real
+                # diagnostic value if a loopback/echo bug ever
+                # recurs, so kept at DEBUG rather than removed.
+                log.debug(f"[AUDIO] Cut loopback link: {src} -> {dst}")
             except Exception as e:
                 log.debug(f"[AUDIO] Failed to cut link {src} -> {dst}: {e}")
 
@@ -801,9 +833,20 @@ def _device_name():
 
 def _clear_history(reason=""):
     global _last_reply_wav, _last_reply_lang, _no_speech_apologized, _locked_language_code
-    _no_speech_apologized = False
-    _locked_language_code = None
+    # 2026-07-31: _no_speech_apologized and _locked_language_code used
+    # to be set here BEFORE acquiring _hist_lock, while processor_thread
+    # writes them without any lock at all — despite a comment elsewhere
+    # claiming processor_thread is the sole writer (matching _call_gen's
+    # genuinely single-writer pattern). It isn't: this function runs on
+    # watchdog_thread, a second writer. A hangup landing mid-turn could
+    # race processor_thread's write and silently clobber a just-set
+    # language lock back to None. Routing both through the same
+    # _hist_lock already guarding the adjacent _history/_last_reply_*
+    # writes below makes the two writers' updates to these actually
+    # synchronized instead of merely usually-fine.
     with _hist_lock:
+        _no_speech_apologized = False
+        _locked_language_code = None
         _history.clear()
         _last_reply_wav = None
         _last_reply_lang = None
@@ -1169,6 +1212,18 @@ CALL_DATA_ENABLED = os.environ.get("CALL_DATA_ENABLED", "1").lower() not in ("0"
 _boot_id = datetime.now().strftime("%Y%m%d_%H%M%S")  # + gen below disambiguates calls within one process run
 _call_data_seq = 0  # processor_thread only — no lock needed, same reasoning as _dump_seq
 
+# 2026-07-31: unlike vad_metrics.csv above, this is training data with
+# lasting value, not diagnostic noise — deleting old turns to "rotate"
+# it would be actively counterproductive to its stated purpose. The
+# actual risk worth guarding against is the disk filling up entirely
+# and taking down call handling itself, not stale data. So instead of
+# rotation, this is a disk-space FLOOR: recording is skipped (once per
+# breach, not spammed) if free space drops below the minimum, rather
+# than writing until the SD card is full and every other file write
+# (including the main log) starts failing too.
+CALL_DATA_MIN_FREE_BYTES = int(os.getenv("CALL_DATA_MIN_FREE_BYTES", str(500 * 1024 * 1024)))  # 500MB floor
+_call_data_low_space_warned = False
+
 
 def _record_turn(gen: int, pcm: bytes, transcript: str, language_code: str, reply_text: str | None) -> None:
     """
@@ -1180,10 +1235,20 @@ def _record_turn(gen: int, pcm: bytes, transcript: str, language_code: str, repl
     recorded as null, not omitted, so a future training pass can still
     learn "this input warrants silence."
     """
-    global _call_data_seq
+    global _call_data_seq, _call_data_low_space_warned
     if not CALL_DATA_ENABLED:
         return
     try:
+        free_bytes = shutil.disk_usage(CALL_DATA_DIR if os.path.isdir(CALL_DATA_DIR) else "/").free
+        if free_bytes < CALL_DATA_MIN_FREE_BYTES:
+            if not _call_data_low_space_warned:
+                _call_data_low_space_warned = True
+                log.warning(
+                    f"[CALL-DATA] Skipping recording — only {free_bytes // (1024*1024)}MB free "
+                    f"(floor {CALL_DATA_MIN_FREE_BYTES // (1024*1024)}MB). Call handling continues normally."
+                )
+            return
+        _call_data_low_space_warned = False
         call_id = f"{_boot_id}_{gen}"
         _call_data_seq += 1
         call_dir = Path(CALL_DATA_DIR) / call_id
@@ -1230,7 +1295,14 @@ def _is_valid(text: str, duration: float) -> bool:
         log.info(f"[FILTER] Hallucination: '{text}'")
         return False
 
-    words = text.split()
+    # re.findall(r"\w+", ...), not .split() — matches every other word-
+    # counting filter in this file (_is_acknowledgment, _is_stop_request,
+    # _is_truncated_suspect, _is_self_echo). 2026-07-31: .split() counts
+    # a punctuation-only token (e.g. "...", "—") as one "word", letting
+    # it slip past MIN_WORDS/MIN_WORDS_PER_SEC when it contains zero
+    # actual words — the one filter using a looser definition than the
+    # rest, a real inconsistency this unifies.
+    words = re.findall(r"\w+", text)
     if len(words) < MIN_WORDS:
         log.info(f"[FILTER] Too few words ({len(words)}): '{text}'")
         return False
@@ -1517,7 +1589,7 @@ def _tts_and_enqueue(text: str, language_code: str, gen: int, reply_id: int) -> 
             # abandoned sentence's full synthesis finishes, delaying
             # how soon the caller's new, interrupting utterance gets
             # picked up off audio_q. The one-level-up abandonment check
-            # in the _ask_streaming loop (ai_caller_final2.py) can only
+            # in the _ask_streaming loop (ai_caller_final3.py) can only
             # catch this BETWEEN sentences, not mid-synthesis — this is
             # the piece that completes the cancellation cascade for
             # that gap.
@@ -2330,7 +2402,8 @@ def processor_thread():
                     # then silence until a turn actually succeeds or the
                     # call ends — bounded by construction, no retries,
                     # and no new message to translate.
-                    _no_speech_apologized = True
+                    with _hist_lock:
+                        _no_speech_apologized = True
                     log.info("[STT] Nothing recognised — informing the caller once")
                     wav = _synthesize(STT_ERROR_MESSAGE, "en-IN")
                     if wav:
@@ -2342,7 +2415,8 @@ def processor_thread():
                         reply_q.put((gen, wav, _next_reply_id(), False))
                 continue
 
-            _no_speech_apologized = False
+            with _hist_lock:
+                _no_speech_apologized = False
             indic_guess = _detect_indic_language(transcript)
             if indic_guess and indic_guess != language_code.lower():
                 log.info(
@@ -2354,7 +2428,8 @@ def processor_thread():
             if _locked_language_code is None:
                 canonical = _canonical_sticky_lang(language_code)
                 if canonical:
-                    _locked_language_code = canonical
+                    with _hist_lock:
+                        _locked_language_code = canonical
                     log.info(
                         f"[LANG-LOCK] Sticking to {canonical} for the "
                         f"rest of this call (first detected language, "
@@ -2774,7 +2849,19 @@ def playback_thread():
             # interrupt flag even on this path, so a genuine barge-in
             # still gets registered correctly rather than logged as a
             # generic playback error.
-            if _mid_play_interrupt.is_set():
+            #
+            # 2026-07-31: this used to trust _mid_play_interrupt alone,
+            # with no check on the exception's actual type. That flag
+            # is set asynchronously by a DIFFERENT thread (recorder_
+            # thread) — an unrelated failure (a genuine pw-play crash,
+            # a broken pipe from something else entirely) racing with a
+            # real barge-in that happened moments earlier could get
+            # misclassified as "just an interrupt" and silently
+            # swallowed, hiding an actual playback failure from the
+            # logs. Only suppress the error log for the specific
+            # exception shape a killed pw-play actually produces.
+            is_expected_kill_exception = isinstance(e, (BrokenPipeError, OSError))
+            if _mid_play_interrupt.is_set() and is_expected_kill_exception:
                 _mid_play_interrupt.clear()
                 _abandoned_reply_id = reply_id
                 barged_in = True
@@ -2783,6 +2870,8 @@ def playback_thread():
                     f"(via exception path) — recorder stays live."
                 )
             else:
+                if _mid_play_interrupt.is_set():
+                    _mid_play_interrupt.clear()
                 log.error(f"[PLAY] Unhandled error: {e}", exc_info=True)
         finally:
             _playing.clear()

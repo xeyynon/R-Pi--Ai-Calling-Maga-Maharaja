@@ -1,0 +1,29 @@
+# Direct dependencies actually imported by this application, pinned to
+# the versions verified working on the deployed Pi as of 2026-07-31.
+#
+# google-cloud-aiplatform is listed even though no file imports it
+# directly: llm_gemini.py uses genai.Client(vertexai=True, ...), and
+# `pip show google-cloud-bigquery`/`google-cloud-storage` confirmed
+# BOTH are declared as required by google-cloud-aiplatform on this
+# exact deployment — i.e. the Vertex AI code path genuinely needs it
+# installed, even without a direct `import`. An earlier pass of this
+# audit assumed bigquery/storage were orphaned cruft from grepping
+# direct imports alone; checking pip's actual dependency graph before
+# touching anything caught that this app-code-only method flagged a
+# real dependency of a real subsystem as garbage. Left in deliberately.
+#
+# Everything else pip installs alongside these (aiplatform's own further
+# transitive dependencies, etc.) is resolved automatically — this file
+# intentionally does not try to pin transitive dependencies by hand.
+#
+# Install: pip install -r requirements.txt
+
+google-cloud-speech==2.40.0
+google-cloud-texttospeech==2.37.0
+google-genai==2.14.0
+google-cloud-aiplatform==1.162.0
+sarvamai==0.1.28
+numpy==2.2.4
+pytz==2026.2
+PyYAML==6.0.2
+webrtcvad==2.0.10

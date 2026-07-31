@@ -11,6 +11,7 @@ stream() — yields text chunks as they arrive from Gemini (used by the
 
 import logging
 import os
+import threading
 
 from google import genai
 from google.genai import types
@@ -22,14 +23,22 @@ log = logging.getLogger("llm_gemini")
 REQUEST_TIMEOUT_MS = 25_000
 
 _client = None
+# 2026-07-31: without this, warmup() racing an early real call from
+# another thread could construct two genai.Client instances — the
+# second silently discarding the first's already-warmed HTTP
+# connection pool. Low likelihood (warmup normally finishes before
+# calls start) but cheap to close outright rather than rely on timing.
+_client_lock = threading.Lock()
 
 
 def _get_client():
     global _client
     if _client is None:
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-id-here")
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-south1")
-        _client = genai.Client(vertexai=True, project=project, location=location)
+        with _client_lock:
+            if _client is None:
+                project = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-id-here")
+                location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-south1")
+                _client = genai.Client(vertexai=True, project=project, location=location)
     return _client
 
 
