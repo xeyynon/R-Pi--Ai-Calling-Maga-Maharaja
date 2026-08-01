@@ -136,12 +136,32 @@ STREAMING_GRACE_SEC = float(os.getenv("SARVAM_STREAMING_GRACE_SEC", "1.5"))
 # short, low-energy "tentative" onset (background noise, not real
 # speech) still spawns a full real Sarvam session, and a second
 # genuine utterance just 5 seconds later had to queue 14.6s behind it
-# for the ONE available slot. Raised to 2 so one likely-noise
-# tentative capture can no longer single-handedly block a real,
-# immediately-following utterance. Sarvam's true per-account limit is
-# still unverified — watch for new connection-rejection errors (not
-# just timeouts) if this needs revisiting.
-SARVAM_MAX_CONCURRENT_SESSIONS = int(os.getenv("SARVAM_MAX_CONCURRENT_SESSIONS", "2"))
+# for the ONE available slot. Raised to 2, which helped but was NOT
+# enough: 2026-07-31, later the same day, a real call showed 3-4 onset-
+# triggered captures landing within a ~10s window (the caller saying
+# "Hello" twice after the bot's reply was slow enough that they
+# repeated themselves — a real, observed vicious cycle: slow reply ->
+# caller repeats -> more concurrent STT load -> even slower) produced
+# stt_wait_ms=8129 on one turn and a full 20s timeout on another. Raised
+# to 4 as an immediate step, then actually looked up Sarvam's real
+# documented limit instead of guessing again (docs.sarvam.ai/api/
+# getting-started/ratelimits): STT WebSocket streaming concurrency is
+# 20 (Starter plan) or 100 (Pro/Business), account-wide. Every number
+# used here (1, 2, 4) was self-imposed and nowhere near the real
+# ceiling — this project's own artificially low limit was the
+# bottleneck all along, not Sarvam's actual capacity. One documented
+# nuance: the guard reacts to how FAST connections open, not just how
+# many are held open at once (rapid bursts can be rejected — WebSocket
+# close code 1003 — well under the stated ceiling; the same number
+# opened a few hundred ms apart succeeds). Real observed load on this
+# single phone line is 3-4 sessions over ~10s, nowhere near a rapid
+# burst, so this should be safe. Set with real headroom (half the
+# Starter-tier ceiling) instead of nudging up reactively again — if a
+# genuine 1003 rejection ever appears in the logs (a distinct failure
+# shape from a client-side "Timed out" — that one's just our own
+# STREAMING_FINISH_TIMEOUT_SEC giving up, not a Sarvam rejection), that
+# would be the actual burst-rate guard, not this ceiling.
+SARVAM_MAX_CONCURRENT_SESSIONS = int(os.getenv("SARVAM_MAX_CONCURRENT_SESSIONS", "10"))
 _sarvam_concurrency = threading.Semaphore(SARVAM_MAX_CONCURRENT_SESSIONS)
 
 # 2026-07-30: real-call testing showed Sarvam's auto language-ID

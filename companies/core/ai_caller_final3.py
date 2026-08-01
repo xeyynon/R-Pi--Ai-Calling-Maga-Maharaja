@@ -223,6 +223,33 @@ VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES", "10"))
 # except genuinely short imperative commands.
 VAD_STOP_CHECK_MIN_FRAMES = int(os.getenv("VAD_STOP_CHECK_MIN_FRAMES", "4"))
 
+# 2026-07-31: onset used to open a real Sarvam STT session (a genuine
+# WebSocket connection, competing for the concurrency pool) on the
+# VERY FIRST frame that passed VAD_ENERGY_THRESHOLD+_is_speech — a
+# single 30ms momentary impulsive noise spike (a click/pop, common on
+# this narrowband Bluetooth SCO link per the project's own earlier
+# spectral analysis) was enough. Real calls showed this repeatedly:
+# many "tentative" captures with real per-frame trigger spikes but low
+# WHOLE-UTTERANCE average energy, and raising SARVAM_MAX_CONCURRENT_
+# SESSIONS three times in one day (1->2->4->10) never actually fixed
+# the underlying flood, it just kept raising the ceiling to match it —
+# confirmed by a real call where even 10 concurrent slots weren't
+# enough and Sarvam's OWN network layer started timing out under the
+# volume. This requires a small number of CONSECUTIVE qualifying
+# frames before actually committing to onset (opening the session),
+# instead of just one — genuine speech sustains for many frames, a
+# momentary click does not. Deliberately kept well under
+# VAD_STOP_CHECK_MIN_FRAMES (4) so a genuinely short "chup"/"stop"
+# utterance still reliably confirms onset with frames to spare — this
+# does NOT touch VAD_ENERGY_THRESHOLD, VAD_MODE, or the barge-in path
+# (a fully separate VAD instance/threshold) at all, so the already-
+# tuned "catch quiet real speech" and "catch a mid-sentence interrupt"
+# behavior are both unaffected. No audio is lost while a candidate is
+# unconfirmed — it's buffered locally and folded in whole once
+# confirmed, so a confirmed utterance is captured from its true first
+# frame, not from the confirmation point.
+VAD_ONSET_CONFIRM_FRAMES = int(os.getenv("VAD_ONSET_CONFIRM_FRAMES", "2"))
+
 # The primary lever: how long a caller must fall silent before the bot
 # decides they're done talking. Expressed in ms (not frames) so that
 # changing VAD_FRAME_MS above can never silently change how long the
@@ -238,7 +265,17 @@ VAD_STOP_CHECK_MIN_FRAMES = int(os.getenv("VAD_STOP_CHECK_MIN_FRAMES", "4"))
 # lekin... abhi tak nahi aaya" arriving as two unrelated turns. 500ms is
 # the lowest value tested with no observed truncation — see
 # STT_Benchmark and VAD workflow session notes for the full sweep.
-VAD_HANGOVER_MS   = int(os.getenv("VAD_HANGOVER_MS", "500"))    # was hardcoded 750ms (SILENCE_FRAMES=25 * 30ms) before this sweep
+# 2026-07-31: raised 500->650ms after a real call showed a tester's
+# speech repeatedly chopped into disconnected short fragments (several
+# 0.6-1.4s captures with real pauses between them, each too brief
+# individually for Sarvam to transcribe correctly) — a real, if modest,
+# latency cost (+150ms on every single reply) traded for capturing
+# natural mid-sentence pauses as one utterance instead of several
+# broken ones. A deliberate, explicit tradeoff against the 500ms value
+# above (chosen for zero truncation, not for this) — revisit if real
+# calls show fragmentation persists even at 650ms, or if the added
+# latency turns out not to be worth it.
+VAD_HANGOVER_MS   = int(os.getenv("VAD_HANGOVER_MS", "650"))    # was hardcoded 750ms (SILENCE_FRAMES=25 * 30ms) before this sweep
 SILENCE_FRAMES    = max(1, VAD_HANGOVER_MS // VAD_FRAME_MS)     # derived, frames — consecutive silent frames = utterance ended
 
 # Was 800ms — same real-call evidence as VAD_MIN_SPEECH_FRAMES above:
@@ -347,6 +384,29 @@ ACK_WORDS = {
     "haan", "acha", "achha", "ji", "theek", "thik", "hai",             # Hindi
 }
 
+# 2026-07-31: a caller's opening "Hello"/"Hi" is used near-identically
+# by English, Hindi, and Telugu speakers alike in India — a phone-
+# greeting convention, not a language choice — so it carries no real
+# language signal. A real call locked the sticky-language decision
+# (see LANG-LOCK below) to en-IN purely because the caller's very
+# first word was "Hello", then genuinely switched to Telugu mid-call —
+# which the lock then prevented from being recognized correctly for
+# the rest of the call. Deliberately NARROW: only the genuinely
+# universal English-loanword greetings, NOT "namaste"/"namaskar" —
+# those actually ARE a real language signal (Hindi-associated), unlike
+# "hello", which carries none. This set exists ONLY to detect "the
+# whole utterance is just a greeting" so that specific case can skip
+# locking and wait for a linguistically distinctive utterance instead
+# — it does NOT affect acknowledgment/stop/repeat handling.
+UNIVERSAL_GREETING_WORDS = {"hello", "hi", "hey", "hallo"}
+
+
+def _is_universal_greeting(transcript: str) -> bool:
+    """True if the transcript is nothing but greeting word(s) common
+    across all three languages — too language-ambiguous to lock on."""
+    words = re.findall(r"\w+", transcript.lower())
+    return bool(words) and all(w in UNIVERSAL_GREETING_WORDS for w in words)
+
 # Substrings that indicate the caller is asking to hear the last reply
 # again, in any of the three languages — handled by replaying the
 # cached last TTS reply instead of a fresh Gemini + TTS round trip.
@@ -439,6 +499,35 @@ def _detect_indic_language(transcript: str) -> str | None:
         return "hi-in"
     if telugu_score > hindi_score:
         return "te-in"
+    return None
+
+
+# 2026-07-31: HINDI_MARKERS/TELUGU_MARKERS above only match ROMANIZED
+# (Latin-script) words — a real call showed Sarvam correctly
+# transcribing a genuinely Telugu word in native script ("కావాలి",
+# "want/need") mixed into an otherwise English sentence, and NEITHER
+# the STT tag (locked to en-IN by the sticky-language feature) NOR
+# _detect_indic_language above (keyword-only, no native-script
+# handling at all) caught it — the reply came back in English despite
+# the caller genuinely using a Telugu word. Native Unicode script is a
+# FAR stronger signal than keyword matching: unlike a coincidental
+# romanized word overlap, actual Devanagari/Telugu characters in the
+# transcript are unambiguous proof the caller said something in that
+# script. Checked as a separate, higher-confidence signal from the
+# keyword-based guess above — see processor_thread for how the two are
+# used differently (this one is confident enough to update the sticky
+# lock itself, not just this turn's reply language).
+_DEVANAGARI_RANGE = (0x0900, 0x097F)  # Hindi
+_TELUGU_RANGE = (0x0C00, 0x0C7F)
+
+
+def _detect_native_script_language(transcript: str) -> str | None:
+    for ch in transcript:
+        cp = ord(ch)
+        if _DEVANAGARI_RANGE[0] <= cp <= _DEVANAGARI_RANGE[1]:
+            return "hi-in"
+        if _TELUGU_RANGE[0] <= cp <= _TELUGU_RANGE[1]:
+            return "te-in"
     return None
 
 
@@ -1873,6 +1962,7 @@ def recorder_thread():
                     return 0, 0, False, bytearray(), time.time(), None
 
                 speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
+                pending_frames, pending_buf = 0, bytearray()
                 # The in-progress utterance's streaming STT session, if
                 # any — started at speech onset, fed every frame while
                 # triggered, finished (or abandoned) at every reset
@@ -2019,6 +2109,7 @@ def recorder_thread():
                             stream_session = None
                         last_speculated_partial = ""
                         speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
+                        pending_frames, pending_buf = 0, bytearray()
                         continue
 
                     barge_in_frames = 0
@@ -2033,6 +2124,24 @@ def recorder_thread():
 
                     if is_speech:
                         if not triggered:
+                            if pending_frames < VAD_ONSET_CONFIRM_FRAMES - 1:
+                                # Still building confirmation — buffer
+                                # this candidate frame locally only. No
+                                # session opened, no state committed,
+                                # behaves exactly like an ordinary idle
+                                # non-speech frame from the rest of the
+                                # loop's point of view (see
+                                # VAD_ONSET_CONFIRM_FRAMES above).
+                                pending_buf += chunk
+                                pending_frames += 1
+                                continue
+                            # This frame reaches confirmation — genuine
+                            # onset, not a momentary noise spike. Open
+                            # the session now and fold in everything
+                            # buffered BEFORE this frame; the shared
+                            # code below then handles THIS frame exactly
+                            # like it always has, so it isn't double-
+                            # counted between pending_buf and buf.
                             t_start = time.time()
                             # Streaming STT starts here, at speech onset —
                             # not after the whole utterance is buffered.
@@ -2060,6 +2169,11 @@ def recorder_thread():
                                 # the lambda actually runs.
                                 is_stale=lambda g=_session_gen: _call_gen != g,
                             )
+                            if pending_buf:
+                                buf += pending_buf
+                                speech_frames += pending_frames
+                                stream_session.feed(bytes(pending_buf))
+                            pending_frames, pending_buf = 0, bytearray()
                         triggered      = True
                         speech_frames += 1
                         silence_run    = 0
@@ -2121,11 +2235,38 @@ def recorder_thread():
                                 tentative = True
                             else:
                                 log.debug(f"[REC] Discarded: {duration:.2f}s / {speech_frames} frames")
+                                # 2026-07-31: this used to call
+                                # stream_session.finish() INLINE — a
+                                # blocking call (session._thread.join(),
+                                # up to STREAMING_FINISH_TIMEOUT_SEC) —
+                                # for content already known to be
+                                # discarded before the call even
+                                # happens (below VAD_STOP_CHECK_MIN_
+                                # FRAMES, can't even be a stop-word).
+                                # Every short noise blip (background
+                                # noise/breathing on the Bluetooth line
+                                # — confirmed frequent on real calls)
+                                # blocked THIS loop from reading any
+                                # more mic frames for however long that
+                                # cleanup took, competing for the same
+                                # Sarvam concurrency slots real
+                                # utterances need — directly
+                                # contributing to the recorder falling
+                                # behind right as the caller started
+                                # genuinely speaking next. Same fix
+                                # already applied to the main enqueue
+                                # path below: hand the cleanup to its
+                                # own thread instead of blocking capture
+                                # on it.
                                 if stream_session is not None:
-                                    stream_session.finish()  # cleanup, result unused
+                                    threading.Thread(
+                                        target=stream_session.finish,
+                                        daemon=True,
+                                    ).start()
                                     stream_session = None
                                 last_speculated_partial = ""
                                 speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
+                                pending_frames, pending_buf = 0, bytearray()
                                 continue
 
                             pcm = bytes(buf)
@@ -2238,6 +2379,16 @@ def recorder_thread():
                             ).start()
 
                             speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
+                            pending_frames, pending_buf = 0, bytearray()
+
+                    else:
+                        # is_speech is False and onset isn't confirmed
+                        # yet — a candidate blip that didn't sustain
+                        # long enough. Clear pending state so a later,
+                        # unrelated frame doesn't wrongly continue an
+                        # old confirmation count.
+                        if pending_frames:
+                            pending_frames, pending_buf = 0, bytearray()
 
             finally:
                 proc.terminate()
@@ -2417,24 +2568,57 @@ def processor_thread():
 
             with _hist_lock:
                 _no_speech_apologized = False
-            indic_guess = _detect_indic_language(transcript)
-            if indic_guess and indic_guess != language_code.lower():
-                log.info(
-                    f"[LANG] Overriding STT tag '{language_code}' -> "
-                    f"'{indic_guess}' based on transcript vocabulary"
-                )
-                language_code = indic_guess
 
-            if _locked_language_code is None:
-                canonical = _canonical_sticky_lang(language_code)
-                if canonical:
+            # Native-script detection first: a FAR stronger, unambiguous
+            # signal than keyword matching (see _detect_native_script_
+            # language's comment) — confident enough to update the
+            # sticky lock itself, not just this turn's reply language.
+            # This is deliberately checked BEFORE the greeting-skip
+            # below: genuine Devanagari/Telugu characters are never
+            # ambiguous the way a bare "Hello" is.
+            native_guess = _detect_native_script_language(transcript)
+            if native_guess:
+                if native_guess != language_code.lower():
+                    log.info(
+                        f"[LANG] Overriding STT tag '{language_code}' -> "
+                        f"'{native_guess}' based on native-script "
+                        f"characters actually present in the transcript."
+                    )
+                    language_code = native_guess
+                canonical = _canonical_sticky_lang(native_guess)
+                if canonical and canonical != _locked_language_code:
                     with _hist_lock:
                         _locked_language_code = canonical
                     log.info(
-                        f"[LANG-LOCK] Sticking to {canonical} for the "
-                        f"rest of this call (first detected language, "
-                        f"from: '{transcript}')."
+                        f"[LANG-LOCK] Re-locking to {canonical} — "
+                        f"genuine native-script content detected, "
+                        f"from: '{transcript}'."
                     )
+            else:
+                indic_guess = _detect_indic_language(transcript)
+                if indic_guess and indic_guess != language_code.lower():
+                    log.info(
+                        f"[LANG] Overriding STT tag '{language_code}' -> "
+                        f"'{indic_guess}' based on transcript vocabulary"
+                    )
+                    language_code = indic_guess
+
+                # 2026-07-31: a bare "Hello"/"Hi"/"Namaste" carries no
+                # real language signal (used near-identically across
+                # all three languages' callers) — skip locking on it so
+                # the decision waits for a linguistically distinctive
+                # utterance instead of committing to whatever Sarvam
+                # happened to auto-tag a universal greeting as.
+                if _locked_language_code is None and not _is_universal_greeting(transcript):
+                    canonical = _canonical_sticky_lang(language_code)
+                    if canonical:
+                        with _hist_lock:
+                            _locked_language_code = canonical
+                        log.info(
+                            f"[LANG-LOCK] Sticking to {canonical} for the "
+                            f"rest of this call (first detected language, "
+                            f"from: '{transcript}')."
+                        )
 
             if _is_acknowledgment(transcript):
                 log.info(f"[ACK] '{transcript}' — acknowledgment, no reply needed")
