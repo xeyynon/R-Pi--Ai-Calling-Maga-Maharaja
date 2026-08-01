@@ -1,0 +1,54 @@
+\
+# ai-caller.service — systemd USER unit (not a system unit).
+#
+# Why a user service, not a system one: the app shells out to
+# pw-record/pw-play/wpctl/pw-link, and PipeWire + WirePlumber run as
+# PER-USER systemd services on this Pi (confirmed: `systemctl --user
+# status pipewire wireplumber` — both "active (running)" under the
+# login user, nothing equivalent at the system level). A system-level
+# service running as this user wouldn't reliably see that user's
+# PipeWire session (XDG_RUNTIME_DIR / session bus wiring gets messy).
+# A user service avoids all of that — it runs inside the same session
+# manager as PipeWire itself, so `After=`/`Wants=` against those unit
+# names just works.
+#
+# Install path: ~/.config/systemd/user/ai-caller.service
+# (NOT /etc/systemd/system/ — see deploy/INSTALL.md for the full,
+# reviewed install steps, including the one system-level command this
+# still needs: `sudo loginctl enable-linger <user>`, so this starts on
+# boot even with nobody logged in over SSH/console.)
+
+[Unit]
+Description=AI Caller — phone-call agent (Maga Maharaja Foods)
+# Wants, not Requires: if PipeWire/WirePlumber are slow to come up on a
+# cold boot, retry (via Restart= below) rather than refusing to ever
+# start at all.
+After=pipewire.service wireplumber.service pipewire-pulse.service network-online.target bluetooth.target
+Wants=pipewire.service wireplumber.service pipewire-pulse.service
+
+[Service]
+Type=simple
+
+# EDIT THIS if your project lives somewhere other than the path used
+# during development — both of these must point at the SAME checkout:
+WorkingDirectory=%h/projects/For Customers
+ExecStart=%h/projects/For Customers/.venv/bin/python3 %h/projects/For Customers/ai_caller_final3.py
+
+# Auto-restart on crash, but not in a tight loop if something is
+# structurally broken (bad config, missing credentials) — 5s backoff,
+# and give up escalating restart attempts rather than hammering the
+# Sarvam/Google APIs if it's crash-looping.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Goes to `journalctl --user -u ai-caller -f` — separate from the
+# app's own ai_caller.log file, which still gets written too (this is
+# just capturing anything that reaches stdout/stderr directly, e.g. a
+# crash traceback before the app's own logging is even set up).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
