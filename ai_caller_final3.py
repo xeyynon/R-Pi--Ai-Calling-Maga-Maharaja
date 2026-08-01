@@ -117,8 +117,10 @@ LLM_MODEL    = "gemini-2.5-flash"   # gemini-2.5-flash-lite would be faster but 
                                      # available in asia-south1 (404) for this project —
                                      # only in us-central1, where the extra India->US
                                      # round trip would cost more than it saves
-LLM_TOKENS   = 150                  # raised from the old 40-token cap — real replies (pricing tables,
-                                     # delivery breakdowns, Telugu/Hindi phrasing) run several sentences
+LLM_TOKENS   = int(os.getenv("LLM_TOKENS", "100"))  # 2026-08-01: capped 150->100 for shorter,
+                                     # phone-call-appropriate replies; raised from the old 40-token
+                                     # cap before that — real replies (pricing tables, delivery
+                                     # breakdowns, Telugu/Hindi phrasing) run several sentences
 LLM_TEMP     = 0.5
 LLM_HISTORY  = 3   # past exchanges to keep in context
 
@@ -987,6 +989,7 @@ def watchdog_thread():
     global _inp_node, _out_node
     had_call = False
     missing_polls = 0
+    active_input_node = None
     log.info("Watchdog started.")
 
     while not _shutdown.is_set():
@@ -1002,12 +1005,38 @@ def watchdog_thread():
                 _kill_loopback_links()
                 missing_polls = 0
 
-            if call_now and not had_call:
+            # 2026-08-01: a hangup followed by a new call within the
+            # CALL_END_DEBOUNCE_POLLS window (~<2*WATCHDOG_SEC, easily
+            # true for "hangup then immediate redial") used to be
+            # invisible here — call_now going False then True again
+            # just reset missing_polls to 0 without had_call ever
+            # clearing, so neither the "call ended" nor "call detected"
+            # branch below ever fired for what is actually a brand-new
+            # caller. Result: the new caller's turns got appended to
+            # the OLD caller's _history, _locked_language_code carried
+            # over, and no greeting played. The node name (which
+            # encodes the Bluetooth MAC + a per-connection index) is
+            # the one reliable signal that a NEW connection came up,
+            # even from the same phone — compare it every poll while a
+            # call is believed active, independent of missing_polls.
+            if call_now and had_call and inp != active_input_node:
+                log.info(f"New call detected mid-debounce (node changed) — device: {_device_name()}")
+                _stop_playback("new call replaced previous one")
+                _clear_history("call ended (node changed)")
+                _drain_queues("call ended (node changed)")
+                _clear_history("new call")
+                _drain_queues("new call")
+                _play_greeting()
+                active_input_node = inp
+                missing_polls = 0
+
+            elif call_now and not had_call:
                 log.info(f"Call detected — device: {_device_name()}")
                 _clear_history("new call")
                 _drain_queues("new call")
                 _play_greeting()
                 had_call = True
+                active_input_node = inp
 
             elif had_call and not call_now:
                 # Debounced: right as a Bluetooth SCO link comes up or
@@ -1025,6 +1054,7 @@ def watchdog_thread():
                     _clear_history("call ended")
                     _drain_queues("call ended")
                     had_call = False
+                    active_input_node = None
                     missing_polls = 0
 
         except Exception as e:
@@ -1701,6 +1731,22 @@ def _tts_and_enqueue(text: str, language_code: str, gen: int, reply_id: int) -> 
     elif rest_pcm:
         # This IS the prefix's own continuation, not a new sentence.
         _enqueue(_pcm_to_wav(bytes(rest_pcm)), continuation=True)
+    elif n_prefix_chunks == TTS_STREAM_PREFIX_CHUNKS and synthesis.failed:
+        # 2026-08-01: streaming failed AFTER exactly the prefix chunks
+        # were already enqueued (and will be played) but BEFORE any
+        # rest_pcm arrived — neither branch above catches this case,
+        # so the caller silently heard only the ~0.4-0.5s prefix with
+        # the rest of the sentence lost, with zero log trace (not even
+        # an error) since `enqueued` is already non-empty by the time
+        # the `not enqueued and synthesis.failed` fallback below is
+        # checked. Can't safely re-synthesize just "the rest" (no
+        # text-level boundary is tracked, only an audio-chunk one),
+        # and re-synthesizing the WHOLE sentence would make the caller
+        # hear the prefix twice — so this is a log-only fix for now:
+        # at least make the truncation visible for diagnosis instead
+        # of it silently looking like the sentence legitimately ended
+        # there.
+        log.warning(f"[TTS-STREAM] Sentence truncated after prefix — streaming failed before the remainder arrived: '{text[:60]}...'")
 
     if not enqueued and synthesis.failed:
         # Streaming failed outright with nothing usable — fall back to
@@ -1962,7 +2008,7 @@ def recorder_thread():
                     return 0, 0, False, bytearray(), time.time(), None
 
                 speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
-                pending_frames, pending_buf = 0, bytearray()
+                pending_frames, pending_buf, pending_misses = 0, bytearray(), 0
                 # The in-progress utterance's streaming STT session, if
                 # any — started at speech onset, fed every frame while
                 # triggered, finished (or abandoned) at every reset
@@ -2109,7 +2155,7 @@ def recorder_thread():
                             stream_session = None
                         last_speculated_partial = ""
                         speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
-                        pending_frames, pending_buf = 0, bytearray()
+                        pending_frames, pending_buf, pending_misses = 0, bytearray(), 0
                         continue
 
                     barge_in_frames = 0
@@ -2173,7 +2219,7 @@ def recorder_thread():
                                 buf += pending_buf
                                 speech_frames += pending_frames
                                 stream_session.feed(bytes(pending_buf))
-                            pending_frames, pending_buf = 0, bytearray()
+                            pending_frames, pending_buf, pending_misses = 0, bytearray(), 0
                         triggered      = True
                         speech_frames += 1
                         silence_run    = 0
@@ -2266,7 +2312,7 @@ def recorder_thread():
                                     stream_session = None
                                 last_speculated_partial = ""
                                 speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
-                                pending_frames, pending_buf = 0, bytearray()
+                                pending_frames, pending_buf, pending_misses = 0, bytearray(), 0
                                 continue
 
                             pcm = bytes(buf)
@@ -2379,7 +2425,7 @@ def recorder_thread():
                             ).start()
 
                             speech_frames, silence_run, triggered, buf, t_start, t_last_voiced = _reset()
-                            pending_frames, pending_buf = 0, bytearray()
+                            pending_frames, pending_buf, pending_misses = 0, bytearray(), 0
 
                     else:
                         # is_speech is False and onset isn't confirmed
@@ -2387,8 +2433,37 @@ def recorder_thread():
                         # long enough. Clear pending state so a later,
                         # unrelated frame doesn't wrongly continue an
                         # old confirmation count.
+                        #
+                        # 2026-08-01: this used to reset unconditionally
+                        # on ANY single non-qualifying frame, discarding
+                        # the whole candidate (and its buffered audio)
+                        # with zero log trace. Given this project's own
+                        # spectral diagnostics already document real
+                        # per-frame click/pop flicker on this narrowband
+                        # Bluetooth SCO link, a single dropout inside
+                        # the ~60ms (VAD_ONSET_CONFIRM_FRAMES=2) onset
+                        # window is exactly the kind of momentary glitch
+                        # that shouldn't be indistinguishable from the
+                        # caller genuinely staying silent — a short,
+                        # quiet word (e.g. "stop") could lose its entire
+                        # candidate to one dropped frame. Tolerating one
+                        # miss per candidate (still buffering that
+                        # frame's audio so a later confirmation isn't
+                        # missing a gap) keeps the original "momentary
+                        # noise doesn't confirm onset" intent while
+                        # closing this silent-loss regression.
                         if pending_frames:
-                            pending_frames, pending_buf = 0, bytearray()
+                            if pending_misses < 1:
+                                pending_buf += chunk
+                                pending_misses += 1
+                            else:
+                                log.debug(
+                                    f"[REC] Onset candidate abandoned after "
+                                    f"{pending_frames} qualifying frame(s) + "
+                                    f"{pending_misses + 1} non-qualifying — "
+                                    f"never reached VAD_ONSET_CONFIRM_FRAMES={VAD_ONSET_CONFIRM_FRAMES}."
+                                )
+                                pending_frames, pending_buf, pending_misses = 0, bytearray(), 0
 
             finally:
                 proc.terminate()
@@ -2725,81 +2800,109 @@ def processor_thread():
             tts_first_ms = None   # time to synthesize that first sentence
             first_audio_ms = None # time from turn start to first reply_q.put
 
-            for sentence, sent_lang in _ask_streaming(transcript, language_code):
-                if llm_ttfs_ms is None:
-                    llm_ttfs_ms = (time.time() - t_llm_stream_start) * 1000
+            try:
+                for sentence, sent_lang in _ask_streaming(transcript, language_code):
+                    if llm_ttfs_ms is None:
+                        llm_ttfs_ms = (time.time() - t_llm_stream_start) * 1000
 
-                if reply_id == _abandoned_reply_id:
-                    # Caller barged in on this reply between sentences —
-                    # playback_thread already stopped playing it and left
-                    # the recorder live. No point paying for more Gemini/
-                    # TTS work on sentences nobody is going to hear.
-                    #
-                    # 2026-07-31 (Tier 2 cascade hardening): this break
-                    # is also what closes the Gemini SSE stream itself —
-                    # _ask_streaming(...) here is never assigned to a
-                    # variable, only used as the for-loop's iterable, so
-                    # CPython drops its last reference the instant the
-                    # loop exits and immediately (refcounting, not a GC
-                    # cycle) sends GeneratorExit through handle_turn_
-                    # streaming() and into llm_gemini.stream()'s own
-                    # `for chunk in response_stream`, unwinding the
-                    # whole chain deterministically. No explicit cancel
-                    # token needed for this leg of the cascade — the
-                    # mid-sentence TTS leg (_tts_and_enqueue) DID need
-                    # one, since that loop reads from its own queue, not
-                    # a chain of generators sharing one reference.
-                    log.info(f"[BARGE-IN] Stopped generating reply {reply_id} — caller interrupted.")
-                    break
+                    if reply_id == _abandoned_reply_id:
+                        # Caller barged in on this reply between sentences —
+                        # playback_thread already stopped playing it and left
+                        # the recorder live. No point paying for more Gemini/
+                        # TTS work on sentences nobody is going to hear.
+                        #
+                        # 2026-07-31 (Tier 2 cascade hardening): this break
+                        # is also what closes the Gemini SSE stream itself —
+                        # _ask_streaming(...) here is never assigned to a
+                        # variable, only used as the for-loop's iterable, so
+                        # CPython drops its last reference the instant the
+                        # loop exits and immediately (refcounting, not a GC
+                        # cycle) sends GeneratorExit through handle_turn_
+                        # streaming() and into llm_gemini.stream()'s own
+                        # `for chunk in response_stream`, unwinding the
+                        # whole chain deterministically. No explicit cancel
+                        # token needed for this leg of the cascade — the
+                        # mid-sentence TTS leg (_tts_and_enqueue) DID need
+                        # one, since that loop reads from its own queue, not
+                        # a chain of generators sharing one reference.
+                        log.info(f"[BARGE-IN] Stopped generating reply {reply_id} — caller interrupted.")
+                        break
 
-                reply_language = sent_lang
+                    reply_language = sent_lang
 
-                # Validate BEFORE synthesis/playback, not after. The
-                # validator is the last-line safety net that strips
-                # accidental "as an AI..." disclosures, off-topic
-                # drift, a repeated opening greeting, and stray
-                # Telugu/Hindi particles leaking into an English reply
-                # (see validator.py). Validating only once the full
-                # reply is assembled — after every sentence has
-                # already been synthesized and queued for playback —
-                # means the caller has already heard the exact content
-                # the validator exists to catch, which defeats it
-                # entirely for a streamed reply.
-                validated = validate_reply(
-                    sentence, fallback_message, is_first_turn,
-                    language_code=language_code or "",
-                )
+                    # Validate BEFORE synthesis/playback, not after. The
+                    # validator is the last-line safety net that strips
+                    # accidental "as an AI..." disclosures, off-topic
+                    # drift, a repeated opening greeting, and stray
+                    # Telugu/Hindi particles leaking into an English reply
+                    # (see validator.py). Validating only once the full
+                    # reply is assembled — after every sentence has
+                    # already been synthesized and queued for playback —
+                    # means the caller has already heard the exact content
+                    # the validator exists to catch, which defeats it
+                    # entirely for a streamed reply.
+                    validated = validate_reply(
+                        sentence, fallback_message, is_first_turn,
+                        language_code=language_code or "",
+                    )
 
-                if validated == fallback_message and sentence.strip() != fallback_message.strip():
-                    # This sentence tripped a safety signal (or was
-                    # stripped down to nothing) — stop trusting the
-                    # rest of this streamed reply rather than
-                    # continuing to speak further raw Gemini output
-                    # after it. Mirrors the old blocking behaviour,
-                    # where a rejected reply became the fallback
-                    # message in its entirety, not a partial one.
-                    log.warning(f"[VALIDATOR] sentence rejected mid-stream: '{sentence}'")
-                    full_reply_parts = [fallback_message]
-                    wav_chunks = []
-                    new_chunks, this_tts_ms = _tts_and_enqueue(fallback_message, reply_language, gen, reply_id)
+                    if validated == fallback_message and sentence.strip() != fallback_message.strip():
+                        # This sentence tripped a safety signal (or was
+                        # stripped down to nothing) — stop trusting the
+                        # rest of this streamed reply rather than
+                        # continuing to speak further raw Gemini output
+                        # after it. Mirrors the old blocking behaviour,
+                        # where a rejected reply became the fallback
+                        # message in its entirety, not a partial one.
+                        log.warning(f"[VALIDATOR] sentence rejected mid-stream: '{sentence}'")
+                        # 2026-08-01: this used to REPLACE full_reply_parts/
+                        # wav_chunks entirely, discarding any sentences from
+                        # earlier in this same reply that had already been
+                        # validated, synthesized, and queued to reply_q — the
+                        # caller still hears those (their audio is already
+                        # queued), but _history and the "repeat that" cache
+                        # ended up recording only the fallback, as if nothing
+                        # else had been said. Appending instead of replacing
+                        # keeps the bot's own memory in sync with what the
+                        # caller actually heard.
+                        full_reply_parts.append(fallback_message)
+                        new_chunks, this_tts_ms = _tts_and_enqueue(fallback_message, reply_language, gen, reply_id)
+                        if new_chunks:
+                            if tts_first_ms is None:
+                                tts_first_ms = this_tts_ms
+                            wav_chunks.extend(new_chunks)
+                            if first_audio_ms is None:
+                                first_audio_ms = (time.time() - t_turn_start) * 1000
+                        break
+
+                    full_reply_parts.append(validated)
+                    log.info(f"[STREAM] Sentence: '{validated}' ({sent_lang})")
+
+                    new_chunks, this_tts_ms = _tts_and_enqueue(validated, sent_lang, gen, reply_id)
                     if new_chunks:
                         if tts_first_ms is None:
                             tts_first_ms = this_tts_ms
                         wav_chunks.extend(new_chunks)
                         if first_audio_ms is None:
                             first_audio_ms = (time.time() - t_turn_start) * 1000
-                    break
-
-                full_reply_parts.append(validated)
-                log.info(f"[STREAM] Sentence: '{validated}' ({sent_lang})")
-
-                new_chunks, this_tts_ms = _tts_and_enqueue(validated, sent_lang, gen, reply_id)
-                if new_chunks:
-                    if tts_first_ms is None:
-                        tts_first_ms = this_tts_ms
-                    wav_chunks.extend(new_chunks)
-                    if first_audio_ms is None:
-                        first_audio_ms = (time.time() - t_turn_start) * 1000
+            except Exception as e:
+                # 2026-08-01: a Gemini stream failure mid-turn (e.g. a
+                # network drop) after 1+ sentences were already
+                # validated, synthesized, and queued to reply_q (so
+                # playback WILL still speak them) used to propagate
+                # straight to the outer handler at the bottom of this
+                # function, skipping the _history/_last_reply_wav/
+                # _record_turn block below entirely — leaving the bot's
+                # own memory with no record of a turn the caller
+                # partially heard (breaking follow-up context and
+                # self-echo detection) and writing no training-data row
+                # for it. Falling through to the same recording code
+                # below with whatever was accumulated before the
+                # failure, instead of losing it, fixes that — a turn
+                # that produced zero sentences before failing still
+                # hits the "empty reply" guard right after this block,
+                # same as before.
+                log.error(f"[PROC] Gemini stream failed mid-turn (reply {reply_id}): {e}", exc_info=True)
 
             total_incl_stt_ms = (
                 stt_wait_ms + first_audio_ms if first_audio_ms is not None else None
@@ -3044,7 +3147,19 @@ def playback_thread():
             # swallowed, hiding an actual playback failure from the
             # logs. Only suppress the error log for the specific
             # exception shape a killed pw-play actually produces.
-            is_expected_kill_exception = isinstance(e, (BrokenPipeError, OSError))
+            #
+            # 2026-08-01: `isinstance(e, (BrokenPipeError, OSError))`
+            # narrows nothing — BrokenPipeError already IS a subclass
+            # of OSError in Python 3, so that tuple check is logically
+            # identical to `isinstance(e, OSError)` alone, meaning ANY
+            # OSError (e.g. a real Bluetooth node/device error from an
+            # actual disconnect, landing at a moment when the flag
+            # happens to still be set from an unrelated earlier
+            # barge-in) still gets swallowed as "just an interrupt".
+            # BrokenPipeError specifically is what a killed pw-play's
+            # write actually raises — checking for it alone is the
+            # narrowing the comment above already describes wanting.
+            is_expected_kill_exception = isinstance(e, BrokenPipeError)
             if _mid_play_interrupt.is_set() and is_expected_kill_exception:
                 _mid_play_interrupt.clear()
                 _abandoned_reply_id = reply_id

@@ -30,6 +30,25 @@ _GREETING_PATTERN = re.compile(
 # the LLM following the prompt instruction.
 _WRONG_LANGUAGE_PARTICLE_PATTERN = re.compile(r"\s*\b(?:andi|ji)\b\s*,?", re.IGNORECASE)
 
+# 2026-08-01: conversation_manager.py prepends "(Reply in Hindi.)" /
+# "(Reply in English.)" / "(Reply in Telugu.)" to the USER turn as a
+# language reminder for Gemini, with an explicit system-prompt
+# instruction to never echo it. Despite that instruction, a real call
+# showed Gemini echoing it verbatim as the start of its OWN reply
+# ("(Reply in Hindi.) Agar aap 10 kilo..."), which then got spoken
+# aloud by TTS. Same deterministic backstop pattern as the two above —
+# strip it if the LLM says it anyway, rather than relying solely on
+# prompt compliance.
+# 2026-08-01, second pass: the original pattern required a literal
+# "." (or nothing) right before the closing paren — "(Reply in
+# Hindi:)" with a colon, which is a plausible Gemini punctuation
+# variant of the same echo, would not have matched. Widened to accept
+# any single terminal punctuation mark there, not just a period.
+_LANGUAGE_REMINDER_ECHO_PATTERN = re.compile(
+    r"^\s*\(\s*reply\s+in\s+(?:english|hindi|telugu)\s*[.:]?\s*\)\s*",
+    re.IGNORECASE,
+)
+
 # Phrases that suggest the model answered something general-knowledge
 # rather than staying inside the business scope, or was steered off
 # its persona by something in the caller's speech. Extend as needed.
@@ -55,6 +74,11 @@ def validate_reply(
     if not reply.strip():
         log.info("[VALIDATOR] empty reply -> using fallback message")
         return fallback_message
+
+    stripped = _LANGUAGE_REMINDER_ECHO_PATTERN.sub("", reply, count=1)
+    if stripped != reply:
+        log.info("[VALIDATOR] stripped echoed language-reminder prefix from reply")
+        reply = stripped.strip() or fallback_message
 
     reply_lower = reply.lower()
     for signal in OFF_TOPIC_SIGNALS:

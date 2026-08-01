@@ -446,13 +446,30 @@ class StreamingSession:
         client = AsyncSarvamAI(api_subscription_key=api_key)
         loop = asyncio.get_event_loop()
 
-        async with client.speech_to_text_streaming.connect(
+        # 2026-08-01: REQUEST_TIMEOUT_SEC was declared but never
+        # actually applied to anything — the WS handshake below had no
+        # timeout of its own. STREAMING_FINISH_TIMEOUT_SEC (used below)
+        # only bounds send/receive AFTER the connection is already
+        # open; a stall during the handshake itself (a silent packet
+        # drop, not an immediate refusal) could block here far past
+        # 20s while still holding this session's _sarvam_concurrency
+        # slot, since that slot is only released in the outer
+        # `finally` once _run_async actually returns. Left unbounded,
+        # a sustained connectivity blip could leak enough slots to
+        # exhaust the whole pool for the rest of the call.
+        ctx = client.speech_to_text_streaming.connect(
             model=SARVAM_MODEL,
             mode=SARVAM_MODE,
             language_code=self._language_code,
             high_vad_sensitivity=True,
             vad_signals=True,
-        ) as ws:
+        )
+        try:
+            ws = await asyncio.wait_for(ctx.__aenter__(), timeout=REQUEST_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            log.error(f"[STT-SARVAM] Connection handshake timed out after {REQUEST_TIMEOUT_SEC}s")
+            raise
+        try:
             sender_done = asyncio.Event()
 
             async def sender():
@@ -523,6 +540,8 @@ class StreamingSession:
                 await recv_task
             except (asyncio.CancelledError, Exception):
                 pass
+        finally:
+            await ctx.__aexit__(None, None, None)
 
 
 def start_streaming_session(language_code: str | None = None, is_stale=None) -> StreamingSession:
